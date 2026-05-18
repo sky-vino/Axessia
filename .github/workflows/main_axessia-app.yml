@@ -1,0 +1,120 @@
+# =============================================================================
+# Axessia (Sky) — Build and deploy to Azure App Service axessia-app
+# =============================================================================
+# What this workflow does on every push to main:
+#   1. Sets up Node 20
+#   2. Installs frontend deps and runs `npm run build` (Vite -> frontend/dist)
+#   3. Installs backend deps and runs `npm run build` (tsc -> backend/dist)
+#   4. Zips everything except node_modules (App Service installs those on
+#      first boot and caches them under /home, so the zip stays small)
+#   5. Logs in to Azure with the federated identity and deploys the zip
+#
+# Notes for the operator:
+#   - The Azure App Service stack must be set to Node 20 LTS (not Python).
+#   - Startup command in App Service: `bash startup.sh`
+#   - Required env vars are listed in azure-appsettings.sample.json.
+# =============================================================================
+name: Build and deploy Node app to Azure Web App - axessia-app
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ── Frontend build ───────────────────────────────────────────────────
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm install --no-audit --no-fund
+
+      - name: Build frontend (Vite)
+        working-directory: frontend
+        run: npm run build
+
+      - name: Verify frontend build
+        run: |
+          test -f frontend/dist/index.html
+          echo "Frontend build:"
+          ls -la frontend/dist
+          ls -la frontend/dist/assets | head
+
+      # ── Backend build ────────────────────────────────────────────────────
+      - name: Install backend deps
+        working-directory: backend
+        run: npm install --no-audit --no-fund
+
+      - name: Build backend (tsc)
+        working-directory: backend
+        run: npm run build
+
+      - name: Verify backend build
+        run: |
+          test -f backend/dist/index.js
+          echo "Backend build:"
+          ls backend/dist | head -20
+
+      # ── Package the deploy zip ───────────────────────────────────────────
+      - name: Create deployment package
+        run: |
+          zip -qr release.zip . \
+            -x ".git/*" \
+            -x ".github/*" \
+            -x "frontend/node_modules/*" \
+            -x "frontend/src/*" \
+            -x "frontend/index.html" \
+            -x "frontend/package*.json" \
+            -x "frontend/tsconfig.json" \
+            -x "frontend/vite.config.ts" \
+            -x "frontend/tailwind.config.js" \
+            -x "frontend/postcss.config.js" \
+            -x "frontend/Dockerfile" \
+            -x "frontend/nginx.conf" \
+            -x "frontend/.dockerignore" \
+            -x "backend/node_modules/*" \
+            -x "backend/src/*" \
+            -x "backend/tsconfig.json" \
+            -x "backend/Dockerfile" \
+            -x "backend/.dockerignore" \
+            -x "backend/data/*" \
+            -x ".env" \
+            -x "backend/.env" \
+            -x ".vscode/*" \
+            -x "*.sqlite*" \
+            -x "*.db"
+          echo ""
+          echo "Deploy package summary:"
+          echo "  size: $(du -h release.zip | cut -f1)"
+          echo "  key files:"
+          unzip -l release.zip | grep -E "startup\.sh|backend/dist/index\.js|frontend/dist/index\.html|backend/package\.json|backend/migrations" | head
+
+      # ── Azure deploy ─────────────────────────────────────────────────────
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZUREAPPSERVICE_CLIENTID_2B7F8A68563540588D2B9FCDDE24980F }}
+          tenant-id:       ${{ secrets.AZUREAPPSERVICE_TENANTID_8ED8A0C152054104A26BD00F1B5AE9E3 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_AFB2DB03E1CD43C295D6E3C5CB7EB2AF }}
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name:  axessia-app
+          slot-name: Production
+          package:   release.zip
