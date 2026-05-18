@@ -6,6 +6,13 @@ on:
       - main
   workflow_dispatch:
 
+# Concurrency lock — if a new push arrives while an older run is still
+# deploying, cancel the older run. This prevents the "409 Conflict" we kept
+# hitting when commits landed back-to-back.
+concurrency:
+  group: deploy-axessia-app
+  cancel-in-progress: true
+
 permissions:
   id-token: write
   contents: read
@@ -23,6 +30,7 @@ jobs:
         with:
           node-version: "20"
 
+      # ── Frontend build ───────────────────────────────────────────────────
       - name: Install frontend deps
         working-directory: frontend
         run: npm install --no-audit --no-fund --legacy-peer-deps
@@ -31,6 +39,7 @@ jobs:
         working-directory: frontend
         run: npm run build
 
+      # ── Backend build ────────────────────────────────────────────────────
       - name: Install backend deps
         working-directory: backend
         run: npm install --no-audit --no-fund --legacy-peer-deps
@@ -39,29 +48,37 @@ jobs:
         working-directory: backend
         run: npm run build
 
-      - name: Install Playwright Chromium for ship
+      # ── Bundle Playwright Chromium into the deploy zip ───────────────────
+      - name: Install Playwright Chromium for shipping
         working-directory: backend
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/playwright-browsers
         run: |
           npx playwright install chromium
-          echo "Chromium installed at:"
+          echo "Chromium installed:"
           ls -la "$PLAYWRIGHT_BROWSERS_PATH"
 
+      # ── Stage exactly what ships ─────────────────────────────────────────
       - name: Stage deploy directory
         run: |
           mkdir -p deploy/backend deploy/frontend deploy/playwright-browsers
+
           cp -r backend/dist          deploy/backend/dist
           cp -r backend/node_modules  deploy/backend/node_modules
           cp -r backend/migrations    deploy/backend/migrations
           cp    backend/package.json  deploy/backend/package.json
+
           cp -r frontend/dist         deploy/frontend/dist
+
           cp -r playwright-browsers/* deploy/playwright-browsers/ 2>/dev/null || true
+
           cp    startup.sh            deploy/startup.sh
           chmod +x deploy/startup.sh
+
           echo ""
           echo "Critical files check:"
           test -f deploy/backend/dist/index.js                 && echo "  OK  backend/dist/index.js"
+          test -f deploy/backend/dist/scanner/scanner.js       && echo "  OK  backend/dist/scanner/scanner.js"
           test -f deploy/backend/migrations/init.sqlite.sql    && echo "  OK  backend/migrations/init.sqlite.sql"
           test -f deploy/frontend/dist/index.html              && echo "  OK  frontend/dist/index.html"
           test -f deploy/startup.sh                            && echo "  OK  startup.sh"
@@ -69,7 +86,15 @@ jobs:
           if [ -n "$CHROME" ]; then
             echo "  OK  bundled chrome at $CHROME"
           else
-            echo "  WARNING: no chrome binary found in deploy/playwright-browsers"
+            echo "  WARNING: no chrome binary in deploy/playwright-browsers"
+          fi
+
+          echo ""
+          echo "Verifying scanner uses headless mode:"
+          if grep -q "headless: true" deploy/backend/dist/scanner/scanner.js; then
+            echo "  OK  scanner is set to headless: true"
+          else
+            echo "  WARNING: scanner does not contain 'headless: true' — scans may fail on Azure"
           fi
 
       - name: Create deployment zip
@@ -78,6 +103,7 @@ jobs:
           zip -qr ../release.zip .
           echo "Deploy zip size: $(du -h ../release.zip | cut -f1)"
 
+      # ── Deploy to Azure ──────────────────────────────────────────────────
       - name: Login to Azure
         uses: azure/login@v2
         with:
