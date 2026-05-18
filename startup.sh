@@ -1,123 +1,98 @@
-name: Build and deploy Node app to Azure Web App - axessia-app
+#!/bin/bash
+# =============================================================================
+# Axessia (Sky) — Azure App Service startup script
+# =============================================================================
+# Chromium binary is shipped INSIDE the zip at /home/site/wwwroot/
+# playwright-browsers. On first boot we copy it to /home/playwright-browsers
+# (which is persistent), and on subsequent boots we just use the cached copy.
+# =============================================================================
+set -e
 
-on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
+echo "============================================================"
+echo "=== Axessia (Sky) — boot $(date -u +'%Y-%m-%dT%H:%M:%SZ') ==="
+echo "============================================================"
+echo "cwd:  $(pwd)"
+echo "node: $(node --version 2>&1)"
 
-permissions:
-  id-token: write
-  contents: read
+cd /home/site/wwwroot
 
-jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
+# ── 1. Chromium system libraries ────────────────────────────────────────────
+echo ""
+echo "[1/4] Installing Chromium system libraries..."
+apt-get update -qq 2>&1 | tail -2 || echo "  (apt-get update non-fatal failure)"
+apt-get install -y -qq \
+    libglib2.0-0 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+    libcups2 libdrm2 libdbus-1-3 libxcb1 libxkbcommon0 libx11-6 \
+    libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
+    libgbm1 libpango-1.0-0 libcairo2 libasound2 \
+    2>&1 | tail -3 || echo "  (some libs may have failed — continuing)"
+echo "[1/4] Done."
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+# ── 2. Copy bundled Chromium to persistent storage ──────────────────────────
+# The build pipeline put chromium-NNNN/chrome-linux64/chrome inside the zip.
+# We mirror it to /home/playwright-browsers so it's not wiped on each deploy.
+export PLAYWRIGHT_BROWSERS_PATH="/home/playwright-browsers"
+echo ""
+echo "[2/4] Setting up Playwright Chromium at $PLAYWRIGHT_BROWSERS_PATH..."
 
-      - name: Set up Node 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+BUNDLED_DIR="/home/site/wwwroot/playwright-browsers"
+mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
 
-      # ── Frontend build ───────────────────────────────────────────────────
-      - name: Install frontend deps
-        working-directory: frontend
-        run: npm install --no-audit --no-fund --legacy-peer-deps
+if [ -d "$BUNDLED_DIR" ] && [ -n "$(ls -A "$BUNDLED_DIR" 2>/dev/null)" ]; then
+    # Figure out which chromium-NNNN folder was bundled
+    BUNDLED_VERSION=$(ls -1 "$BUNDLED_DIR" | grep '^chromium-' | head -1)
+    if [ -n "$BUNDLED_VERSION" ]; then
+        TARGET="$PLAYWRIGHT_BROWSERS_PATH/$BUNDLED_VERSION"
+        if [ ! -d "$TARGET" ] || [ ! -f "$TARGET/chrome-linux64/chrome" ]; then
+            echo "  Copying bundled $BUNDLED_VERSION to $TARGET ..."
+            rm -rf "$TARGET"
+            cp -r "$BUNDLED_DIR/$BUNDLED_VERSION" "$TARGET"
+            # Some Playwright versions also need a "marker" file
+            cp -r "$BUNDLED_DIR"/* "$PLAYWRIGHT_BROWSERS_PATH/" 2>/dev/null || true
+            chmod -R +rx "$TARGET" || true
+            echo "  Copied. chrome size: $(du -h "$TARGET/chrome-linux64/chrome" 2>/dev/null | cut -f1)"
+        else
+            echo "  $BUNDLED_VERSION already present — skipping copy."
+        fi
+    else
+        echo "  WARNING: no chromium-* folder found in $BUNDLED_DIR"
+        ls -la "$BUNDLED_DIR" 2>/dev/null | head
+    fi
+else
+    echo "  WARNING: $BUNDLED_DIR empty or missing. Scans will fail until Chromium is installed."
+fi
 
-      - name: Build frontend (Vite)
-        working-directory: frontend
-        run: npm run build
+# Verify
+CHROME_BIN=$(find "$PLAYWRIGHT_BROWSERS_PATH" -type f -name chrome 2>/dev/null | head -1)
+if [ -n "$CHROME_BIN" ] && [ -x "$CHROME_BIN" ]; then
+    echo "[2/4] Chrome ready at $CHROME_BIN"
+else
+    echo "[2/4] WARNING: no executable chrome binary found after setup."
+fi
 
-      - name: Verify frontend build
-        run: |
-          test -f frontend/dist/index.html
-          ls -la frontend/dist
+# ── 3. Persistent storage ────────────────────────────────────────────────────
+echo ""
+echo "[3/4] Ensuring /home/data exists..."
+mkdir -p /home/data
+echo "[3/4] OK."
 
-      # ── Backend build ────────────────────────────────────────────────────
-      - name: Install backend deps
-        working-directory: backend
-        run: npm install --no-audit --no-fund --legacy-peer-deps
+# ── 4. Frontend sanity check ─────────────────────────────────────────────────
+echo ""
+echo "[4/4] Frontend build check..."
+if [ -f frontend/dist/index.html ]; then
+    echo "  frontend/dist/index.html present ($(wc -c < frontend/dist/index.html) bytes)"
+    echo "  asset count: $(ls -1 frontend/dist/assets 2>/dev/null | wc -l)"
+else
+    echo "  WARNING: frontend/dist/index.html not found. Only /api will work."
+fi
 
-      - name: Build backend (tsc)
-        working-directory: backend
-        run: npm run build
+# ── Boot ──────────────────────────────────────────────────────────────────
+export PORT="${PORT:-8080}"
+export NODE_ENV="${NODE_ENV:-production}"
 
-      # ── Install Playwright Chromium INTO the build ───────────────────────
-      # We download Chromium to a local folder that we then ship inside the
-      # zip. This bypasses all the npx-can't-find-the-CLI issues at runtime.
-      - name: Install Playwright Chromium for ship
-        working-directory: backend
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/playwright-browsers
-        run: |
-          npx playwright install chromium
-          echo "Chromium installed at:"
-          ls -la "$PLAYWRIGHT_BROWSERS_PATH"
-
-      - name: Verify backend build
-        run: |
-          test -f backend/dist/index.js
-          test -f backend/migrations/init.sqlite.sql
-          ls backend/dist
-          ls backend/migrations
-
-      # ── Stage deploy directory ──────────────────────────────────────────
-      - name: Stage deploy directory
-        run: |
-          mkdir -p deploy/backend deploy/frontend deploy/playwright-browsers
-
-          cp -r backend/dist          deploy/backend/dist
-          cp -r backend/node_modules  deploy/backend/node_modules
-          cp -r backend/migrations    deploy/backend/migrations
-          cp    backend/package.json  deploy/backend/package.json
-
-          cp -r frontend/dist         deploy/frontend/dist
-
-          # Pre-built Chromium bundled in zip; startup.sh copies it to /home
-          cp -r playwright-browsers/* deploy/playwright-browsers/ 2>/dev/null || true
-
-          cp    startup.sh            deploy/startup.sh
-          chmod +x deploy/startup.sh
-
-          echo ""
-          echo "Critical files check:"
-          test -f deploy/backend/dist/index.js                 && echo "  OK  backend/dist/index.js"
-          test -f deploy/backend/migrations/init.sqlite.sql    && echo "  OK  backend/migrations/init.sqlite.sql"
-          test -f deploy/frontend/dist/index.html              && echo "  OK  frontend/dist/index.html"
-          test -f deploy/startup.sh                            && echo "  OK  startup.sh"
-          test -d deploy/backend/node_modules                  && echo "  OK  backend/node_modules"
-          CHROME=$(find deploy/playwright-browsers -name chrome -type f | head -1)
-          if [ -n "$CHROME" ]; then
-            echo "  OK  bundled chrome at $CHROME"
-          else
-            echo "  WARNING: no chrome binary found in deploy/playwright-browsers"
-          fi
-
-          echo ""
-          echo "Deploy tree (top level):"
-          ls -la deploy/
-
-      - name: Create deployment zip
-        working-directory: deploy
-        run: |
-          zip -qr ../release.zip .
-          echo "Deploy zip size: $(du -h ../release.zip | cut -f1)"
-
-      # ── Azure deploy ─────────────────────────────────────────────────────
-      - name: Login to Azure
-        uses: azure/login@v2
-        with:
-          client-id:       ${{ secrets.AZUREAPPSERVICE_CLIENTID_2B7F8A68563540588D2B9FCDDE24980F }}
-          tenant-id:       ${{ secrets.AZUREAPPSERVICE_TENANTID_8ED8A0C152054104A26BD00F1B5AE9E3 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_AFB2DB03E1CD43C295D6E3C5CB7EB2AF }}
-
-      - name: Deploy to Azure Web App
-        uses: azure/webapps-deploy@v3
-        with:
-          app-name:  axessia-app
-          slot-name: Production
-          package:   release.zip
+echo ""
+echo "============================================================"
+echo "Starting Node backend on port $PORT (NODE_ENV=$NODE_ENV)"
+echo "============================================================"
+cd backend
+exec node dist/index.js
