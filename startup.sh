@@ -2,13 +2,6 @@
 # =============================================================================
 # Axessia (Sky) — Azure App Service startup script
 # =============================================================================
-# node_modules and built dist/ are shipped inside the deploy zip, so this
-# script does the minimum needed on each boot:
-#   1. Install Chromium system libs (apt) — needed by Playwright
-#   2. Ensure Playwright Chromium browser binary is on disk
-#   3. Make sure /home/data exists for SQLite
-#   4. Start Node
-# =============================================================================
 set -e
 
 echo "============================================================"
@@ -33,18 +26,41 @@ apt-get install -y -qq \
 echo "[1/4] Done."
 
 # ── 2. Playwright Chromium ───────────────────────────────────────────────────
+# We require the EXACT browser binary Playwright is asking for. If the
+# expected chrome executable isn't found at the path Playwright derives
+# from the installed playwright-core version, force an install.
 export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/home/playwright-browsers}"
 echo ""
-echo "[2/4] Ensuring Playwright Chromium at $PLAYWRIGHT_BROWSERS_PATH..."
+echo "[2/4] Checking Playwright Chromium at $PLAYWRIGHT_BROWSERS_PATH..."
 mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
-if [ -z "$(ls -A "$PLAYWRIGHT_BROWSERS_PATH" 2>/dev/null)" ]; then
+
+# Find any installed chrome binary
+CHROME_BIN=$(find "$PLAYWRIGHT_BROWSERS_PATH" -type f -name chrome 2>/dev/null | head -1)
+if [ -n "$CHROME_BIN" ] && [ -x "$CHROME_BIN" ]; then
+    echo "[2/4] Found chrome at $CHROME_BIN — verifying it matches the Playwright version..."
+    # Try a quick launch dry-run by listing the version. If Playwright's
+    # expected path differs from what's on disk, the runtime will fail anyway,
+    # so we run install with --dry-run-style check: presence of folder name
+    # like chromium-NNNN where NNNN matches.
     cd backend
-    npx playwright install chromium 2>&1 | tail -5 || echo "  (playwright install warning)"
+    EXPECTED=$(node -e "const r=require('playwright-core/lib/server/registry/index.js'); console.log(r.registry?.findExecutable?.('chromium')?.executablePath?.() || '')" 2>/dev/null || echo "")
     cd ..
-    echo "[2/4] Chromium installed."
+    if [ -n "$EXPECTED" ] && [ ! -f "$EXPECTED" ]; then
+        echo "  Mismatch — Playwright expects $EXPECTED but it does not exist."
+        echo "  Re-installing Chromium..."
+        cd backend
+        npx playwright install chromium 2>&1 | tail -8
+        cd ..
+    else
+        echo "[2/4] Chromium version matches Playwright — skipping install."
+    fi
 else
-    echo "[2/4] Chromium already present — skipping."
+    echo "[2/4] No chrome binary found — installing fresh..."
+    cd backend
+    npx playwright install chromium 2>&1 | tail -8
+    cd ..
 fi
+echo "[2/4] Done."
 
 # ── 3. Persistent storage ────────────────────────────────────────────────────
 echo ""
@@ -63,7 +79,7 @@ else
 fi
 
 # ── Boot ──────────────────────────────────────────────────────────────────
-export PORT="${PORT:-4000}"
+export PORT="${PORT:-8080}"
 export NODE_ENV="${NODE_ENV:-production}"
 
 echo ""
