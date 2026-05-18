@@ -1,11 +1,5 @@
 #!/bin/bash
-# =============================================================================
 # Axessia (Sky) — Azure App Service startup script
-# =============================================================================
-# Chromium binary is shipped INSIDE the zip at /home/site/wwwroot/
-# playwright-browsers. On first boot we copy it to /home/playwright-browsers
-# (which is persistent), and on subsequent boots we just use the cached copy.
-# =============================================================================
 set -e
 
 echo "============================================================"
@@ -16,7 +10,7 @@ echo "node: $(node --version 2>&1)"
 
 cd /home/site/wwwroot
 
-# ── 1. Chromium system libraries ────────────────────────────────────────────
+# [1/4] Chromium system libraries
 echo ""
 echo "[1/4] Installing Chromium system libraries..."
 apt-get update -qq 2>&1 | tail -2 || echo "  (apt-get update non-fatal failure)"
@@ -28,9 +22,7 @@ apt-get install -y -qq \
     2>&1 | tail -3 || echo "  (some libs may have failed — continuing)"
 echo "[1/4] Done."
 
-# ── 2. Copy bundled Chromium to persistent storage ──────────────────────────
-# The build pipeline put chromium-NNNN/chrome-linux64/chrome inside the zip.
-# We mirror it to /home/playwright-browsers so it's not wiped on each deploy.
+# [2/4] Copy bundled Chromium from zip to persistent storage
 export PLAYWRIGHT_BROWSERS_PATH="/home/playwright-browsers"
 echo ""
 echo "[2/4] Setting up Playwright Chromium at $PLAYWRIGHT_BROWSERS_PATH..."
@@ -39,7 +31,6 @@ BUNDLED_DIR="/home/site/wwwroot/playwright-browsers"
 mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
 
 if [ -d "$BUNDLED_DIR" ] && [ -n "$(ls -A "$BUNDLED_DIR" 2>/dev/null)" ]; then
-    # Figure out which chromium-NNNN folder was bundled
     BUNDLED_VERSION=$(ls -1 "$BUNDLED_DIR" | grep '^chromium-' | head -1)
     if [ -n "$BUNDLED_VERSION" ]; then
         TARGET="$PLAYWRIGHT_BROWSERS_PATH/$BUNDLED_VERSION"
@@ -47,22 +38,19 @@ if [ -d "$BUNDLED_DIR" ] && [ -n "$(ls -A "$BUNDLED_DIR" 2>/dev/null)" ]; then
             echo "  Copying bundled $BUNDLED_VERSION to $TARGET ..."
             rm -rf "$TARGET"
             cp -r "$BUNDLED_DIR/$BUNDLED_VERSION" "$TARGET"
-            # Some Playwright versions also need a "marker" file
             cp -r "$BUNDLED_DIR"/* "$PLAYWRIGHT_BROWSERS_PATH/" 2>/dev/null || true
             chmod -R +rx "$TARGET" || true
-            echo "  Copied. chrome size: $(du -h "$TARGET/chrome-linux64/chrome" 2>/dev/null | cut -f1)"
+            echo "  Copied."
         else
             echo "  $BUNDLED_VERSION already present — skipping copy."
         fi
     else
         echo "  WARNING: no chromium-* folder found in $BUNDLED_DIR"
-        ls -la "$BUNDLED_DIR" 2>/dev/null | head
     fi
 else
     echo "  WARNING: $BUNDLED_DIR empty or missing. Scans will fail until Chromium is installed."
 fi
 
-# Verify
 CHROME_BIN=$(find "$PLAYWRIGHT_BROWSERS_PATH" -type f -name chrome 2>/dev/null | head -1)
 if [ -n "$CHROME_BIN" ] && [ -x "$CHROME_BIN" ]; then
     echo "[2/4] Chrome ready at $CHROME_BIN"
@@ -70,23 +58,23 @@ else
     echo "[2/4] WARNING: no executable chrome binary found after setup."
 fi
 
-# ── 3. Persistent storage ────────────────────────────────────────────────────
+# [3/4] Persistent storage
 echo ""
 echo "[3/4] Ensuring /home/data exists..."
 mkdir -p /home/data
 echo "[3/4] OK."
 
-# ── 4. Frontend sanity check ─────────────────────────────────────────────────
+# [4/4] Frontend sanity check
 echo ""
 echo "[4/4] Frontend build check..."
 if [ -f frontend/dist/index.html ]; then
     echo "  frontend/dist/index.html present ($(wc -c < frontend/dist/index.html) bytes)"
     echo "  asset count: $(ls -1 frontend/dist/assets 2>/dev/null | wc -l)"
 else
-    echo "  WARNING: frontend/dist/index.html not found. Only /api will work."
+    echo "  WARNING: frontend/dist/index.html not found."
 fi
 
-# ── Boot ──────────────────────────────────────────────────────────────────
+# Boot
 export PORT="${PORT:-8080}"
 export NODE_ENV="${NODE_ENV:-production}"
 
