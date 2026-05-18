@@ -49,32 +49,47 @@ jobs:
       - name: Verify backend build
         run: |
           test -f backend/dist/index.js
+          test -f backend/migrations/init.sqlite.sql
           ls backend/dist
+          ls backend/migrations
 
-      # ── Package the deploy zip ───────────────────────────────────────────
-      # NOTE: we include backend/node_modules in the deploy zip so the App
-      # Service container does NOT need to npm install on boot. This avoids
-      # the native-compile flakiness and cuts cold-start time from 5min to ~30s.
-      - name: Create deployment package
+      # ── Stage deploy directory ──────────────────────────────────────────
+      # We assemble exactly what needs to ship — nothing more, nothing less.
+      # This is safer than the "zip everything then exclude" approach because
+      # we cannot accidentally drop a required file.
+      - name: Stage deploy directory
         run: |
-          zip -qr release.zip . \
-            -x ".git/*" \
-            -x ".github/*" \
-            -x "frontend/node_modules/*" \
-            -x "frontend/src/*" \
-            -x "frontend/index.html" \
-            -x "frontend/tsconfig.json" \
-            -x "frontend/vite.config.ts" \
-            -x "frontend/tailwind.config.js" \
-            -x "frontend/postcss.config.js" \
-            -x "backend/src/*" \
-            -x "backend/tsconfig.json" \
-            -x "backend/data/*" \
-            -x ".env" \
-            -x "backend/.env" \
-            -x "*.sqlite*" \
-            -x "*.db"
-          echo "Deploy zip size: $(du -h release.zip | cut -f1)"
+          mkdir -p deploy/backend deploy/frontend
+
+          # Backend: compiled JS + deps + migrations + package metadata
+          cp -r backend/dist          deploy/backend/dist
+          cp -r backend/node_modules  deploy/backend/node_modules
+          cp -r backend/migrations    deploy/backend/migrations
+          cp    backend/package.json  deploy/backend/package.json
+
+          # Frontend: only the built dist (no source, no node_modules)
+          cp -r frontend/dist         deploy/frontend/dist
+
+          # Top-level boot script
+          cp    startup.sh            deploy/startup.sh
+          chmod +x deploy/startup.sh
+
+          echo ""
+          echo "Deploy tree:"
+          find deploy -maxdepth 3 -type d | sort
+          echo ""
+          echo "Critical files check:"
+          test -f deploy/backend/dist/index.js          && echo "  OK  backend/dist/index.js"
+          test -f deploy/backend/migrations/init.sqlite.sql && echo "  OK  backend/migrations/init.sqlite.sql"
+          test -f deploy/frontend/dist/index.html       && echo "  OK  frontend/dist/index.html"
+          test -f deploy/startup.sh                     && echo "  OK  startup.sh"
+          test -d deploy/backend/node_modules           && echo "  OK  backend/node_modules ($(ls deploy/backend/node_modules | wc -l) packages)"
+
+      - name: Create deployment zip
+        working-directory: deploy
+        run: |
+          zip -qr ../release.zip .
+          echo "Deploy zip size: $(du -h ../release.zip | cut -f1)"
 
       # ── Azure deploy ─────────────────────────────────────────────────────
       - name: Login to Azure
