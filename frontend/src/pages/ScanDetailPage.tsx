@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { scanApi, reportApi, issueApi } from "../services/api";
@@ -6,7 +6,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   ArrowLeft, LayoutDashboard, AlertTriangle, Code2,
   FlaskConical, Eye, Loader2, RefreshCw,
-  Layers, FileText, RotateCcw, ListChecks, Trash2, X
+  Layers, FileText, RotateCcw, ListChecks, ShieldCheck
 } from "lucide-react";
 
 import SummaryTab   from "../components/tabs/SummaryTab";
@@ -15,10 +15,12 @@ import FixesTab     from "../components/tabs/FixesTab";
 import TestCasesTab from "../components/tabs/TestCasesTab";
 import LiveDomTab   from "../components/tabs/LiveDomTab";
 import StatesTab    from "../components/tabs/StatesTab";
+import WcagTab      from "../components/tabs/WcagTab";
 
 const TABS = [
   { id: "summary",   label: "Summary",     icon: LayoutDashboard },
   { id: "issues",    label: "Issues",      icon: AlertTriangle },
+  { id: "wcag",      label: "WCAG",        icon: ShieldCheck },
   { id: "fixes",     label: "AI Fixes",    icon: Code2 },
   { id: "states",    label: "UI States",   icon: Layers },
   { id: "testcases", label: "Test Cases",  icon: FlaskConical },
@@ -33,18 +35,6 @@ const STATUS_COLORS: Record<string, string> = {
   cancelled: "text-slate-500 bg-slate-500/10",
 };
 
-const REPORT_SECTION_OPTIONS = [
-  { id: "executive", label: "Executive report" },
-  { id: "summary", label: "Summary" },
-  { id: "testcases", label: "Test cases" },
-  { id: "states", label: "UI states" },
-  { id: "issues", label: "Issues" },
-];
-
-function shortId(id?: string) {
-  return String(id || "").slice(0, 8).toUpperCase();
-}
-
 export default function ScanDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -55,11 +45,7 @@ export default function ScanDetailPage() {
   const [focusedStateIssueId, setFocusedStateIssueId] = useState<string | null>(null);
   const [focusedStateName, setFocusedStateName] = useState<string | null>(null);
   const [downloading, setDownloading] = useState<string | null>(null);
-  const [reportMenuOpen, setReportMenuOpen] = useState(false);
-  const [reportSections, setReportSections] = useState<string[]>(REPORT_SECTION_OPTIONS.map(option => option.id));
   const [rerunning, setRerunning] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-  const [confirmAction, setConfirmAction] = useState<"rerun" | "delete" | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [scanLogs, setScanLogs] = useState<string[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
@@ -104,57 +90,30 @@ export default function ScanDetailPage() {
     return () => ws.close();
   }, [id, qc]);
 
-  // PDF Report download
-  const handleDownloadReport = async () => {
-    if (!id || downloading === "report") return;
-    const sections = reportSections.length ? reportSections : REPORT_SECTION_OPTIONS.map(option => option.id);
-
-    const win = window.open("", "_blank");
-    if (!win) return;
-    win.document.write(`
-      <html>
-        <head><title>Preparing Accessibility Report</title></head>
-        <body style="font-family: Arial, sans-serif; padding: 24px; color: #1f2937;">
-          <h2>Preparing report...</h2>
-          <p>Please wait while the accessibility report is generated.</p>
-        </body>
-      </html>
-    `);
-    win.document.close();
-
-    setDownloading("report");
-    try {
-      const { data: html } = await reportApi.getReport(id, sections);
-      const blob = new Blob([html], { type: "text/html;charset=utf-8" });
-      const blobUrl = URL.createObjectURL(blob);
-      win.location.replace(blobUrl);
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
-    } catch {
-      win.document.open();
-      win.document.write(`
-        <html>
-          <head><title>Report unavailable</title></head>
-          <body style="font-family: Arial, sans-serif; padding: 24px; color: #1f2937;">
-            <h2>Report could not be opened</h2>
-            <p>Your session may have expired. Please sign in again and try the PDF Report button once more.</p>
-          </body>
-        </html>
-      `);
-      win.document.close();
-    } finally {
-      setDownloading(null);
-      setReportMenuOpen(false);
+  // ── PDF Report download ──────────────────────────────────────────────────
+  const handleDownloadReport = () => {
+    if (!id) return;
+    const url = reportApi.getReportUrl(id);
+    const token = (() => {
+      try {
+        const s = JSON.parse(localStorage.getItem("accessibility-auth") || "{}");
+        return s?.state?.accessToken || "";
+      } catch { return ""; }
+    })();
+    // Open in new tab → user prints to PDF with Ctrl+P
+    const win = window.open("about:blank", "_blank");
+    if (win) {
+      // Fetch with auth header and write into new window
+      setDownloading("report");
+      fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+        .then(r => r.text())
+        .then(html => {
+          win.document.write(html);
+          win.document.close();
+          setDownloading(null);
+        })
+        .catch(() => { win.close(); setDownloading(null); });
     }
-  };
-
-  const toggleReportSection = (sectionId: string) => {
-    setReportSections(current => {
-      if (current.includes(sectionId)) {
-        const next = current.filter(id => id !== sectionId);
-        return next.length ? next : current;
-      }
-      return [...current, sectionId];
-    });
   };
 
   const handleRefresh = async () => {
@@ -180,18 +139,6 @@ export default function ScanDetailPage() {
       navigate(`/scans/${res.data.scan.id}`);
     } finally {
       setRerunning(false);
-      setConfirmAction(null);
-    }
-  };
-  const handleDeleteScan = async () => {
-    if (!id || deleting) return;
-    setDeleting(true);
-    try {
-      await scanApi.delete(id);
-      navigate("/");
-    } finally {
-      setDeleting(false);
-      setConfirmAction(null);
     }
   };
 
@@ -213,7 +160,7 @@ export default function ScanDetailPage() {
   }
 
   const isRunning = scan.status === "running" || scan.status === "queued";
-  const canRerun = scan.status === "completed" || scan.status === "failed" || scan.status === "cancelled";
+  const isComplete = scan.status === "completed";
 
   return (
     <div className="flex flex-col h-screen">
@@ -236,7 +183,6 @@ export default function ScanDetailPage() {
                 </span>
               </div>
               <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-slate-600 mt-1">
-                <span>ID: <span className="font-mono text-slate-400">{shortId(scan.id)}</span></span>
                 <span>{(scan.urls || []).join(", ").slice(0, 100)}</span>
                 {isRunning && <span className="text-accent font-medium">Progress: {scan.progress}%</span>}
               </div>
@@ -245,9 +191,9 @@ export default function ScanDetailPage() {
 
           {/* Action buttons */}
           <div className="flex items-center gap-2">
-            {canRerun && (
+            {isComplete && (
               <button
-                onClick={() => setConfirmAction("rerun")}
+                onClick={handleRerunScan}
                 disabled={rerunning}
                 className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg border transition-all hover:bg-white/[0.04]"
                 style={{ borderColor: "rgba(15,118,110,0.3)", color: "#0f766e" }}
@@ -257,80 +203,21 @@ export default function ScanDetailPage() {
                 Re-run
               </button>
             )}
-            <button
-              onClick={() => setConfirmAction("delete")}
-              disabled={deleting}
-              className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg border transition-all hover:bg-red-400/10"
-              style={{ borderColor: "rgba(248,113,113,0.35)", color: "#f87171" }}
-              title="Delete this scan and its related results"
-            >
-              {deleting ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
-              Delete
-            </button>
-            {scan.status === "completed" && (
-              <div className="relative">
+            {isComplete && (
+              <>
                 <button
-                  onClick={() => setReportMenuOpen(open => !open)}
+                  onClick={handleDownloadReport}
                   disabled={downloading === "report"}
                   className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg border transition-all hover:bg-white/[0.04]"
                   style={{ borderColor: "rgba(15,118,110,0.3)", color: "#0f766e" }}
-                  title="Choose report sections before opening the printable report"
+                  title="Open report in browser — use Ctrl+P to save as PDF"
                 >
                   {downloading === "report"
                     ? <Loader2 size={13} className="animate-spin" />
                     : <FileText size={13} />}
                   PDF Report
                 </button>
-                {reportMenuOpen && (
-                  <div
-                    className="absolute right-0 top-full mt-2 w-72 rounded-xl border p-3 z-30 shadow-2xl"
-                    style={{ background: "var(--surface-1)", borderColor: "var(--border-strong)" }}
-                  >
-                    <div className="text-xs font-semibold mb-2" style={{ color: "var(--text-strong)" }}>Report contents</div>
-                    <div className="space-y-2 mb-3">
-                      {REPORT_SECTION_OPTIONS.map(option => (
-                        <label key={option.id} className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: "var(--text)" }}>
-                          <input
-                            type="checkbox"
-                            checked={reportSections.includes(option.id)}
-                            onChange={() => toggleReportSection(option.id)}
-                            className="h-3.5 w-3.5"
-                          />
-                          <span>{option.label}</span>
-                        </label>
-                      ))}
-                    </div>
-                    <div className="grid grid-cols-2 gap-2 mb-3">
-                      <button
-                        type="button"
-                        onClick={() => setReportSections(REPORT_SECTION_OPTIONS.map(option => option.id))}
-                        className="text-xs px-2 py-1.5 rounded-lg border"
-                        style={{ borderColor: "var(--border-strong)", color: "var(--text)" }}
-                      >
-                        All
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setReportSections(["executive"])}
-                        className="text-xs px-2 py-1.5 rounded-lg border"
-                        style={{ borderColor: "var(--border-strong)", color: "var(--text)" }}
-                      >
-                        Executive
-                      </button>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={handleDownloadReport}
-                      disabled={downloading === "report"}
-                      className="w-full flex items-center justify-center gap-1.5 text-xs px-3 py-2 rounded-lg border transition-all disabled:opacity-60"
-                      style={{ borderColor: "rgba(15,118,110,0.35)", color: "#0f766e", background: "rgba(15,118,110,0.08)" }}
-                    >
-                      {downloading === "report" ? <Loader2 size={13} className="animate-spin" /> : <FileText size={13} />}
-                      Open printable report
-                    </button>
-                  </div>
-                )}
-              </div>
+              </>
             )}
             <button onClick={handleRefresh}
               disabled={refreshing}
@@ -355,16 +242,12 @@ export default function ScanDetailPage() {
                 <span className="text-[11px] text-slate-600">Latest checks first</span>
               </div>
               <div className="space-y-1.5 max-h-32 overflow-y-auto pr-1">
-                {(scanLogs.length ? scanLogs : [scan.status === "queued" ? "Waiting for an available scan worker" : "Preparing scan modules and browser context"]).map((log, index) => {
-                  const tone = log.startsWith("SUCCESS:") ? "success" : log.startsWith("WARN:") ? "warn" : log.startsWith("ERROR:") ? "error" : "info";
-                  const color = tone === "success" ? "#10b981" : tone === "warn" ? "#f59e0b" : tone === "error" ? "#ff4d6d" : index === 0 ? "var(--accent)" : "var(--muted)";
-                  const textColor = tone === "success" ? "text-emerald-400" : tone === "warn" ? "text-amber-400" : tone === "error" ? "text-red-400" : "text-slate-500";
-                  return (
-                  <div key={`${log}-${index}`} className={`flex items-start gap-2 text-xs ${textColor} leading-relaxed`}>
-                    <span className="mt-1 h-1.5 w-1.5 rounded-full flex-shrink-0" style={{ background: color }} />
+                {(scanLogs.length ? scanLogs : [scan.status === "queued" ? "Waiting for an available scan worker" : "Preparing scan modules and browser context"]).map((log, index) => (
+                  <div key={`${log}-${index}`} className="flex items-start gap-2 text-xs text-slate-500 leading-relaxed">
+                    <span className="mt-1 h-1.5 w-1.5 rounded-full flex-shrink-0" style={{ background: index === 0 ? "var(--accent)" : "var(--muted)" }} />
                     <span className="whitespace-normal break-words">{log}</span>
                   </div>
-                );})}
+                ))}
               </div>
             </div>
           </div>
@@ -375,10 +258,7 @@ export default function ScanDetailPage() {
           {TABS.map((tab) => {
             const isActive = activeTab === tab.id;
             return (
-              <button key={tab.id} onClick={() => {
-                if (tab.id === "fixes") setFocusedFixIssueId(null);
-                setActiveTab(tab.id);
-              }}
+              <button key={tab.id} onClick={() => setActiveTab(tab.id)}
                 className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium rounded-t-lg transition-all relative whitespace-nowrap flex-shrink-0 ${
                   isActive ? "selected-tab-solid" : "text-slate-500 hover:text-slate-300"
                 }`}
@@ -402,44 +282,6 @@ export default function ScanDetailPage() {
         </div>
       </div>
 
-      <AnimatePresence>
-        {confirmAction && (
-          <motion.div className="fixed inset-0 z-50 flex items-center justify-center px-4" style={{ background: "rgba(0,0,0,0.48)" }} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-            <motion.div initial={{ scale: 0.96, y: 8 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.96, y: 8 }} className="w-full max-w-md rounded-xl p-5 shadow-2xl" style={{ background: "var(--surface-1)", border: "1px solid var(--border-strong)" }}>
-              <div className="flex items-start justify-between gap-4 mb-4">
-                <div>
-                  <h3 className="text-base font-semibold text-slate-100">{confirmAction === "delete" ? "Delete scan?" : "Re-run scan?"}</h3>
-                  <p className="text-xs text-slate-500 mt-1">This action will be recorded in the admin audit trail.</p>
-                </div>
-                <button type="button" onClick={() => setConfirmAction(null)} className="text-slate-500 hover:text-slate-200" aria-label="Close dialog"><X size={16} /></button>
-              </div>
-              <div className="rounded-lg p-3 mb-4 space-y-1" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
-                <div className="text-sm text-slate-300">{scan.name || "Untitled Scan"}</div>
-                <div className="text-xs font-mono text-slate-500">ID: {shortId(scan.id)}</div>
-              </div>
-              <p className="text-sm text-slate-400 leading-relaxed mb-5">
-                {confirmAction === "delete"
-                  ? "Deleting removes the scan, issues, screenshots, and test cases from this workspace."
-                  : "Re-running creates a new scan with the same URLs, authentication, and scan options."}
-              </p>
-              <div className="flex items-center justify-end gap-2">
-                <button type="button" onClick={() => setConfirmAction(null)} className="px-3 py-2 text-xs rounded-lg border border-white/10 text-slate-400 hover:bg-white/[0.04]">Cancel</button>
-                <button
-                  type="button"
-                  onClick={confirmAction === "delete" ? handleDeleteScan : handleRerunScan}
-                  disabled={deleting || rerunning}
-                  className={`px-3 py-2 text-xs rounded-lg font-semibold inline-flex items-center gap-2 ${confirmAction === "delete" ? "text-black" : "sky-primary"}`}
-                  style={confirmAction === "delete" ? { background: "#f87171" } : undefined}
-                >
-                  {(deleting || rerunning) && <Loader2 size={13} className="animate-spin" />}
-                  {confirmAction === "delete" ? "Delete scan" : "Create re-run"}
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
       {/* Tab content */}
       <div className="flex-1 overflow-y-auto">
         <AnimatePresence mode="wait">
@@ -451,7 +293,8 @@ export default function ScanDetailPage() {
             className="h-full">
             {activeTab === "summary"   && <SummaryTab   scan={scan} />}
             {activeTab === "issues"    && <IssuesTab    scanId={scan.id} focusedIssueId={focusedIssueId} onOpenAiFix={(issueId) => { setFocusedIssueId(null); setFocusedFixIssueId(issueId); setActiveTab("fixes"); }} onOpenState={(issue) => { setFocusedIssueId(null); setFocusedStateIssueId(issue.id); setFocusedStateName(issue.state_label || issue.state || issue.phase || "default"); setActiveTab("states"); }} />}
-            {activeTab === "fixes"     && <FixesTab     scanId={scan.id} focusedIssueId={focusedFixIssueId} onBackToIssue={(issueId) => { setFocusedFixIssueId(null); setFocusedIssueId(issueId); setActiveTab("issues"); }} />}
+            {activeTab === "wcag"      && <WcagTab      scanId={scan.id} />}
+            {activeTab === "fixes"     && <FixesTab     scanId={scan.id} focusedIssueId={focusedFixIssueId} onBackToIssue={(issueId) => { setFocusedIssueId(issueId); setActiveTab("issues"); }} />}
             {activeTab === "states"    && <StatesTab    scanId={scan.id} focusedIssueId={focusedStateIssueId} preferredState={focusedStateName} onBackToIssue={(issueId) => { setFocusedIssueId(issueId); setActiveTab("issues"); }} />}
             {activeTab === "testcases" && <TestCasesTab scanId={scan.id} />}
             {activeTab === "livedom"   && <LiveDomTab   scanId={scan.id} />}
@@ -462,13 +305,3 @@ export default function ScanDetailPage() {
     </div>
   );
 }
-
-
-
-
-
-
-
-
-
-
