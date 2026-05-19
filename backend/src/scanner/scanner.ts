@@ -70,7 +70,16 @@ export class AccessibilityScanner {
 
     const browser = await chromium.launch({
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-extensions",
+        "--no-first-run",
+        "--window-size=1366,768",
+      ],
     });
 
     try {
@@ -209,11 +218,24 @@ export class AccessibilityScanner {
   }
 
   private async createBrowserContext(browser: any, opts: ScanOptions): Promise<any> {
-    return browser.newContext({
+    const context = await browser.newContext({
       viewport: { width: opts.viewport_width || 1366, height: opts.viewport_height || 768 },
       ignoreHTTPSErrors: true,
-      locale: "en-US",
+      locale: "it-IT",
+      timezoneId: "Europe/Rome",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      extraHTTPHeaders: {
+        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+      },
+      colorScheme: "light",
     });
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      Object.defineProperty(navigator, "languages", { get: () => ["it-IT", "it", "en-US", "en"] });
+      Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, "platform", { get: () => "Win32" });
+    });
+    return context;
   }
 
   private async handleLogin(page: any, auth: any): Promise<string> {
@@ -259,7 +281,7 @@ export class AccessibilityScanner {
 
       const otpSelector = this.authSelector(auth, "otp_selector");
       const otpSubmitSelector = this.authSelector(auth, "otp_submit_selector");
-      await this.waitForOtpPage(page, auth, 30000);
+      const otpAppeared = await this.waitForOtpPage(page, auth, 30000);
       const otpValue = await this.resolveOtpValue(page, auth, 30000);
       const otpControlVisible = await this.hasVisibleAuthControl(page, otpSelector);
       if (otpSelector && otpControlVisible && !otpValue) {
@@ -282,6 +304,8 @@ export class AccessibilityScanner {
         } catch (otpErr) {
           throw new Error(`OTP field was configured but could not be completed: ${(otpErr as Error)?.message || otpErr}`);
         }
+      } else if (!otpAppeared) {
+        this.onProgress(18, "OTP page was not detected; checking whether login completed without OTP");
       }
 
       await this.waitForPostLoginReady(page, auth, loginUrl);
@@ -406,9 +430,10 @@ export class AccessibilityScanner {
     await page.waitForTimeout(1500);
   }
 
-  private async waitForOtpPage(page: any, auth: any, timeout = 30000): Promise<void> {
+  private async waitForOtpPage(page: any, auth: any, timeout = 30000): Promise<boolean> {
     const otpSelector = this.authSelector(auth, "otp_selector");
     const otpSourceSelector = this.authSelector(auth, "otp_source_selector");
+    const passwordSelector = this.authSelector(auth, "password_selector");
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
       const hasOtpText = Boolean(await this.resolveOtpValue(page, auth, 1000).catch(() => ""));
@@ -416,12 +441,16 @@ export class AccessibilityScanner {
       const hasSource = await this.hasVisibleAuthControl(page, otpSourceSelector).catch(() => false);
       if (hasOtpText || hasOtpInput || hasSource) {
         this.onProgress(17, "SUCCESS: OTP page detected");
-        return;
+        return true;
+      }
+      const passwordStillVisible = await this.hasVisibleAuthControl(page, passwordSelector).catch(() => false);
+      if (!passwordStillVisible && !/\/login|signin|sign-in|auth/i.test(page.url())) {
+        return false;
       }
       await page.waitForLoadState("domcontentloaded", { timeout: 1000 }).catch(() => undefined);
       await page.waitForTimeout(700);
     }
-    throw new Error("OTP page did not appear after clicking Accedi.");
+    return false;
   }
 
   private selectorCandidates(selectorList?: string): string[] {
@@ -470,6 +499,8 @@ export class AccessibilityScanner {
         for (const selector of this.selectorCandidates(selectorList)) {
           const typed = await this.deepFocusAndTypeInRoot(page, root, selector, value).catch(() => false);
           if (typed && await this.verifyFieldValue(page, selector, value)) return;
+          const mouseTyped = await this.deepMouseAndTypeInRoot(page, root, selector, value).catch(() => false);
+          if (mouseTyped && await this.verifyFieldValue(page, selector, value)) return;
           const filled = await this.deepFillInRoot(root, selector, value).catch(() => false);
           if (filled) return;
         }
@@ -712,6 +743,66 @@ export class AccessibilityScanner {
     if (!focused) return false;
     await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => undefined);
     await page.keyboard.type(value, { delay: 20 });
+    return true;
+  }
+
+  private async deepMouseAndTypeInRoot(page: any, root: any, selector: string, value: string): Promise<boolean> {
+    const point = await root.evaluate((selector: string) => {
+      const isVisible = (el: Element) => {
+        const rect = (el as HTMLElement).getBoundingClientRect();
+        const style = window.getComputedStyle(el as HTMLElement);
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+      };
+      const queryDeep = (container: Document | ShadowRoot | Element, selector: string): Element | null => {
+        const isJs = selector.startsWith("js=");
+        const isXPath = selector.startsWith("/") || selector.startsWith("xpath=");
+        if (isJs) {
+          try {
+            const el = Function(`"use strict"; return (${selector.slice(3)});`)();
+            if (el instanceof Element) return el;
+          } catch {
+            return null;
+          }
+          return null;
+        }
+        if (isXPath) {
+          const expression = selector.replace(/^xpath=/, "").replace(/^\/\//, ".//");
+          try {
+            const doc = container instanceof Document ? container : container.ownerDocument!;
+            const result = doc.evaluate(expression, container, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+            if (result.singleNodeValue instanceof Element) return result.singleNodeValue;
+          } catch {
+            return null;
+          }
+        }
+        if (!isXPath) {
+          try {
+            const direct = (container as Document | ShadowRoot | Element).querySelector(selector);
+            if (direct) return direct;
+          } catch {
+            return null;
+          }
+        }
+        const children = Array.from((container as Document | ShadowRoot | Element).querySelectorAll("*"));
+        for (const child of children) {
+          const shadow = (child as HTMLElement).shadowRoot;
+          if (!shadow) continue;
+          const found = queryDeep(shadow, selector);
+          if (found) return found;
+        }
+        return null;
+      };
+      const el = queryDeep(document, selector) as HTMLElement | null;
+      if (!el || !isVisible(el)) return null;
+      el.scrollIntoView({ block: "center", inline: "center" });
+      const rect = el.getBoundingClientRect();
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    }, selector);
+    if (!point) return false;
+    await page.mouse.click(point.x, point.y, { delay: 60 });
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => undefined);
+    await page.keyboard.press("Backspace").catch(() => undefined);
+    await page.keyboard.type(value, { delay: 45 });
     return true;
   }
 
