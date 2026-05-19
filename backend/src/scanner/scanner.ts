@@ -281,7 +281,7 @@ export class AccessibilityScanner {
 
       const otpSelector = this.authSelector(auth, "otp_selector");
       const otpSubmitSelector = this.authSelector(auth, "otp_submit_selector");
-      const otpAppeared = await this.waitForOtpPage(page, auth, 30000);
+      await this.waitForOtpPage(page, auth, 30000);
       const otpValue = await this.resolveOtpValue(page, auth, 30000);
       const otpControlVisible = await this.hasVisibleAuthControl(page, otpSelector);
       if (otpSelector && otpControlVisible && !otpValue) {
@@ -304,8 +304,6 @@ export class AccessibilityScanner {
         } catch (otpErr) {
           throw new Error(`OTP field was configured but could not be completed: ${(otpErr as Error)?.message || otpErr}`);
         }
-      } else if (!otpAppeared) {
-        this.onProgress(18, "OTP page was not detected; checking whether login completed without OTP");
       }
 
       await this.waitForPostLoginReady(page, auth, loginUrl);
@@ -430,10 +428,9 @@ export class AccessibilityScanner {
     await page.waitForTimeout(1500);
   }
 
-  private async waitForOtpPage(page: any, auth: any, timeout = 30000): Promise<boolean> {
+  private async waitForOtpPage(page: any, auth: any, timeout = 30000): Promise<void> {
     const otpSelector = this.authSelector(auth, "otp_selector");
     const otpSourceSelector = this.authSelector(auth, "otp_source_selector");
-    const passwordSelector = this.authSelector(auth, "password_selector");
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
       const hasOtpText = Boolean(await this.resolveOtpValue(page, auth, 1000).catch(() => ""));
@@ -441,16 +438,12 @@ export class AccessibilityScanner {
       const hasSource = await this.hasVisibleAuthControl(page, otpSourceSelector).catch(() => false);
       if (hasOtpText || hasOtpInput || hasSource) {
         this.onProgress(17, "SUCCESS: OTP page detected");
-        return true;
-      }
-      const passwordStillVisible = await this.hasVisibleAuthControl(page, passwordSelector).catch(() => false);
-      if (!passwordStillVisible && !/\/login|signin|sign-in|auth/i.test(page.url())) {
-        return false;
+        return;
       }
       await page.waitForLoadState("domcontentloaded", { timeout: 1000 }).catch(() => undefined);
       await page.waitForTimeout(700);
     }
-    return false;
+    throw new Error("OTP page did not appear after clicking Accedi.");
   }
 
   private selectorCandidates(selectorList?: string): string[] {
@@ -1140,7 +1133,6 @@ export class AccessibilityScanner {
     }
     return false;
   }
-
   private async resolveOtpValue(page: any, auth: any, timeout = 15000): Promise<string> {
     if (auth.otp_code) return String(auth.otp_code).trim();
     const otpSourceSelector = this.authSelector(auth, "otp_source_selector");
