@@ -6,25 +6,27 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   ArrowLeft, LayoutDashboard, AlertTriangle, Code2,
   FlaskConical, Eye, Loader2, RefreshCw,
-  Layers, FileText, RotateCcw, ListChecks, ShieldCheck
+  Layers, FileText, RotateCcw, ListChecks, ShieldCheck, Volume2
 } from "lucide-react";
 
-import SummaryTab   from "../components/tabs/SummaryTab";
-import IssuesTab    from "../components/tabs/IssuesTab";
-import FixesTab     from "../components/tabs/FixesTab";
-import TestCasesTab from "../components/tabs/TestCasesTab";
-import LiveDomTab   from "../components/tabs/LiveDomTab";
-import StatesTab    from "../components/tabs/StatesTab";
-import WcagTab      from "../components/tabs/WcagTab";
+import SummaryTab        from "../components/tabs/SummaryTab";
+import IssuesTab         from "../components/tabs/IssuesTab";
+import FixesTab          from "../components/tabs/FixesTab";
+import TestCasesTab      from "../components/tabs/TestCasesTab";
+import LiveDomTab        from "../components/tabs/LiveDomTab";
+import StatesTab         from "../components/tabs/StatesTab";
+import WcagTab           from "../components/tabs/WcagTab";
+import ScreenReaderTab   from "../components/tabs/ScreenReaderTab";
 
 const TABS = [
-  { id: "summary",   label: "Summary",     icon: LayoutDashboard },
-  { id: "issues",    label: "Issues",      icon: AlertTriangle },
-  { id: "wcag",      label: "WCAG",        icon: ShieldCheck },
-  { id: "fixes",     label: "AI Fixes",    icon: Code2 },
-  { id: "states",    label: "UI States",   icon: Layers },
-  { id: "testcases", label: "Test Cases",  icon: FlaskConical },
-  { id: "livedom",   label: "Live DOM",    icon: Eye },
+  { id: "summary",      label: "Summary",       icon: LayoutDashboard },
+  { id: "issues",       label: "Issues",        icon: AlertTriangle },
+  { id: "wcag",         label: "WCAG",          icon: ShieldCheck },
+  { id: "screenreader", label: "Screen Reader", icon: Volume2 },
+  { id: "fixes",        label: "AI Fixes",      icon: Code2 },
+  { id: "states",       label: "UI States",     icon: Layers },
+  { id: "testcases",    label: "Test Cases",    icon: FlaskConical },
+  { id: "livedom",      label: "Live DOM",      icon: Eye },
 ];
 
 const STATUS_COLORS: Record<string, string> = {
@@ -67,7 +69,6 @@ export default function ScanDetailPage() {
   });
   const visibleIssuesTotal = visibleIssuesData?.data?.total ?? 0;
 
-  // WebSocket for real-time progress
   useEffect(() => {
     if (!id) return;
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
@@ -90,7 +91,6 @@ export default function ScanDetailPage() {
     return () => ws.close();
   }, [id, qc]);
 
-  // ── PDF Report download ──────────────────────────────────────────────────
   const handleDownloadReport = () => {
     if (!id) return;
     const url = reportApi.getReportUrl(id);
@@ -100,10 +100,8 @@ export default function ScanDetailPage() {
         return s?.state?.accessToken || "";
       } catch { return ""; }
     })();
-    // Open in new tab → user prints to PDF with Ctrl+P
     const win = window.open("about:blank", "_blank");
     if (win) {
-      // Fetch with auth header and write into new window
       setDownloading("report");
       fetch(url, { headers: { Authorization: `Bearer ${token}` } })
         .then(r => r.text())
@@ -131,6 +129,7 @@ export default function ScanDetailPage() {
       setRefreshing(false);
     }
   };
+
   const handleRerunScan = async () => {
     if (!id || rerunning) return;
     setRerunning(true);
@@ -164,7 +163,6 @@ export default function ScanDetailPage() {
 
   return (
     <div className="flex flex-col h-screen">
-      {/* Top bar */}
       <div className="flex-shrink-0 px-8 pt-6 pb-0" style={{ borderBottom: "1px solid var(--border)", background: "rgba(255,255,255,0.025)" }}>
         <div className="flex items-start justify-between mb-5">
           <div className="flex items-start gap-4">
@@ -189,7 +187,6 @@ export default function ScanDetailPage() {
             </div>
           </div>
 
-          {/* Action buttons */}
           <div className="flex items-center gap-2">
             {isComplete && (
               <button
@@ -204,20 +201,18 @@ export default function ScanDetailPage() {
               </button>
             )}
             {isComplete && (
-              <>
-                <button
-                  onClick={handleDownloadReport}
-                  disabled={downloading === "report"}
-                  className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg border transition-all hover:bg-white/[0.04]"
-                  style={{ borderColor: "rgba(15,118,110,0.3)", color: "#0f766e" }}
-                  title="Open report in browser — use Ctrl+P to save as PDF"
-                >
-                  {downloading === "report"
-                    ? <Loader2 size={13} className="animate-spin" />
-                    : <FileText size={13} />}
-                  PDF Report
-                </button>
-              </>
+              <button
+                onClick={handleDownloadReport}
+                disabled={downloading === "report"}
+                className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg border transition-all hover:bg-white/[0.04]"
+                style={{ borderColor: "rgba(15,118,110,0.3)", color: "#0f766e" }}
+                title="Open report in browser — use Ctrl+P to save as PDF"
+              >
+                {downloading === "report"
+                  ? <Loader2 size={13} className="animate-spin" />
+                  : <FileText size={13} />}
+                PDF Report
+              </button>
             )}
             <button onClick={handleRefresh}
               disabled={refreshing}
@@ -227,7 +222,6 @@ export default function ScanDetailPage() {
           </div>
         </div>
 
-        {/* Progress bar */}
         {isRunning && (
           <div className="mb-4 space-y-3">
             <div className="w-full h-0.5 rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,0.06)" }}>
@@ -253,7 +247,6 @@ export default function ScanDetailPage() {
           </div>
         )}
 
-        {/* Tabs */}
         <div className="flex gap-0.5 overflow-x-auto">
           {TABS.map((tab) => {
             const isActive = activeTab === tab.id;
@@ -282,7 +275,6 @@ export default function ScanDetailPage() {
         </div>
       </div>
 
-      {/* Tab content */}
       <div className="flex-1 overflow-y-auto">
         <AnimatePresence mode="wait">
           <motion.div key={activeTab}
@@ -291,14 +283,14 @@ export default function ScanDetailPage() {
             exit={{ opacity: 0, y: -6 }}
             transition={{ duration: 0.2 }}
             className="h-full">
-            {activeTab === "summary"   && <SummaryTab   scan={scan} />}
-            {activeTab === "issues"    && <IssuesTab    scanId={scan.id} focusedIssueId={focusedIssueId} onOpenAiFix={(issueId) => { setFocusedIssueId(null); setFocusedFixIssueId(issueId); setActiveTab("fixes"); }} onOpenState={(issue) => { setFocusedIssueId(null); setFocusedStateIssueId(issue.id); setFocusedStateName(issue.state_label || issue.state || issue.phase || "default"); setActiveTab("states"); }} />}
-            {activeTab === "wcag"      && <WcagTab      scanId={scan.id} />}
-            {activeTab === "fixes"     && <FixesTab     scanId={scan.id} focusedIssueId={focusedFixIssueId} onBackToIssue={(issueId) => { setFocusedIssueId(issueId); setActiveTab("issues"); }} />}
-            {activeTab === "states"    && <StatesTab    scanId={scan.id} focusedIssueId={focusedStateIssueId} preferredState={focusedStateName} onBackToIssue={(issueId) => { setFocusedIssueId(issueId); setActiveTab("issues"); }} />}
-            {activeTab === "testcases" && <TestCasesTab scanId={scan.id} />}
-            {activeTab === "livedom"   && <LiveDomTab   scanId={scan.id} />}
-
+            {activeTab === "summary"      && <SummaryTab      scan={scan} />}
+            {activeTab === "issues"       && <IssuesTab       scanId={scan.id} focusedIssueId={focusedIssueId} onOpenAiFix={(issueId) => { setFocusedIssueId(null); setFocusedFixIssueId(issueId); setActiveTab("fixes"); }} onOpenState={(issue) => { setFocusedIssueId(null); setFocusedStateIssueId(issue.id); setFocusedStateName(issue.state_label || issue.state || issue.phase || "default"); setActiveTab("states"); }} />}
+            {activeTab === "wcag"         && <WcagTab         scanId={scan.id} />}
+            {activeTab === "screenreader" && <ScreenReaderTab scanId={scan.id} />}
+            {activeTab === "fixes"        && <FixesTab        scanId={scan.id} focusedIssueId={focusedFixIssueId} onBackToIssue={(issueId) => { setFocusedIssueId(issueId); setActiveTab("issues"); }} />}
+            {activeTab === "states"       && <StatesTab       scanId={scan.id} focusedIssueId={focusedStateIssueId} preferredState={focusedStateName} onBackToIssue={(issueId) => { setFocusedIssueId(issueId); setActiveTab("issues"); }} />}
+            {activeTab === "testcases"    && <TestCasesTab    scanId={scan.id} />}
+            {activeTab === "livedom"      && <LiveDomTab      scanId={scan.id} />}
           </motion.div>
         </AnimatePresence>
       </div>
