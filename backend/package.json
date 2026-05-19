@@ -48,3 +48,9 @@
     "typescript": "^5.8.3"
   }
 }
+{
+  "dependencies": {
+    "...your existing deps...": "...",
+    "pdf-lib": "^1.17.1"
+  }
+}
