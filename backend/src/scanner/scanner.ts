@@ -13,7 +13,6 @@
  *  zoomPointer.ts     — zoom lock, reflow, touch targets, gestures
  *  stateScanner.ts    — hover/focus/expanded/error/tab states + dynamic interactions
  *  ownership.ts       — component/owner attribution
- *  pdfScanner.ts      — tagged PDF accessibility checks (routed from this file)
  */
 
 import { chromium } from "playwright";
@@ -52,31 +51,7 @@ export class AccessibilityScanner {
 
   async run(): Promise<ScanResult> {
     const opts: ScanOptions = { ...this.scan.scan_options };
-    const allUrls: string[] = this.scan.urls || [];
-    // ── Route PDF URLs to the PDF accessibility scanner ──────────────────
-    const pdfUrls = allUrls.filter(u => /\.pdf(\?|$|#)/i.test(u));
-    const urls: string[] = allUrls.filter(u => !/\.pdf(\?|$|#)/i.test(u));
-    if (pdfUrls.length > 0) {
-      const { runPdfScan } = await import("./pdfScanner");
-      for (const pdfUrl of pdfUrls) {
-        try {
-          logger.info(`Routing ${pdfUrl} to PDF scanner`);
-          const pdfResult = await runPdfScan(pdfUrl, this.scan.state_label);
-          this.allIssues.push(...pdfResult.issues);
-          this.testCases.push(...pdfResult.testCases);
-        } catch (err) {
-          logger.error(`PDF scan failed for ${pdfUrl}:`, err);
-        }
-      }
-      if (urls.length === 0) {
-        this.allIssues = this.prioritizeIssues(this.calibrateIssues(this.deduplicateIssues(this.allIssues)));
-        this.generateTestCases();
-        this.generateManualHybridReviewCases();
-        const score = this.computeScore(this.allIssues);
-        logger.info(`PDF-only scan complete: ${this.allIssues.length} issues, score ${score}`);
-        return { issues: this.allIssues, testCases: this.testCases, domSnapshots: this.domSnapshots, score };
-      }
-    }
+    const urls: string[] = this.scan.urls || [];
     const authConfig = this.scan.auth_config;
     const extraStates = opts.extra_states || [];
     const scannedEntrypoints = new Set<string>();
@@ -116,7 +91,13 @@ export class AccessibilityScanner {
                   if (authConfig.auto_accept_cookies !== false) {
                     await this.clearCookieConsentWithProgress(loginPage, this.authSelector(authConfig, "cookie_accept_selector"), progress, "login page");
                   }
-                  await this.runFullPageScan(loginPage, authConfig.login_url, opts, extraStates, progress);
+                  await this.runFullPageScan(
+                    loginPage,
+                    authConfig.login_url,
+                    { ...opts, run_states: false },
+                    [],
+                    progress
+                  );
                   scannedEntrypoints.add(loginKey);
                 }
               } catch (err) {
@@ -667,12 +648,12 @@ export class AccessibilityScanner {
       const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
       if (setter) setter.call(el, "");
       else el.value = "";
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContentBackward", data: null }));
       if (setter) setter.call(el, payload.value);
       else el.value = payload.value;
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: payload.value }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      el.dispatchEvent(new Event("blur", { bubbles: true }));
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: payload.value }));
+      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      el.dispatchEvent(new Event("blur", { bubbles: true, composed: true }));
       return el.value === payload.value;
     }, { selector, value });
   }
