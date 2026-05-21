@@ -251,6 +251,7 @@ export class AccessibilityScanner {
       await this.waitForSkyLoginReady(page);
       if (auth.auto_accept_cookies !== false) await this.waitAndClearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"), 12000);
       const loginUrl = page.url();
+      logger.info(`[LOGIN-DIAG] Login page loaded. URL: ${loginUrl}`);
 
       logger.info(`Using configured login selectors: username='${usernameSelector}', password='${passwordSelector}', submit='${submitSelector}'`);
 
@@ -259,6 +260,7 @@ export class AccessibilityScanner {
       if (!usernameVerified) {
         throw new Error(`Login username field was not found, was not filled, or did not retain the value with selector: ${usernameSelector}`);
       }
+      logger.info(`[LOGIN-DIAG] Username field filled and verified.`);
       this.onProgress(12, "SUCCESS: Username entered");
 
       let passwordFilled = await this.tryFillFirst(page, passwordSelector, auth.password || "", 12000);
@@ -267,6 +269,7 @@ export class AccessibilityScanner {
       if (!passwordVerified) {
         throw new Error(`Login password field was not found, was not filled, or did not retain the value with selector: ${passwordSelector}`);
       }
+      logger.info(`[LOGIN-DIAG] Password field filled and verified.`);
       this.onProgress(16, "SUCCESS: Password entered");
 
       if (auth.auto_accept_cookies !== false) await this.waitAndClearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"), 8000);
@@ -274,9 +277,13 @@ export class AccessibilityScanner {
       if (!readyToSubmit) {
         throw new Error("Refusing to click Accedi because username/password are not both verified immediately before submit.");
       }
+      logger.info(`[LOGIN-DIAG] About to click Accedi (submit) button.`);
       const submittedPassword = await this.tryClickFirst(page, submitSelector);
+      logger.info(`[LOGIN-DIAG] Accedi click result: ${submittedPassword ? "clicked via selector" : "fallback to keyboard Enter"}`);
       if (!submittedPassword) await page.keyboard.press("Enter").catch(() => undefined);
       await this.waitForLoginTransition(page, auth, loginUrl, 5000);
+      const urlAfterSubmit = page.url();
+      logger.info(`[LOGIN-DIAG] After Accedi click + transition wait. URL: ${urlAfterSubmit} (changed: ${urlAfterSubmit !== loginUrl ? "YES" : "NO"})`);
       if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
 
       const otpSelector = this.authSelector(auth, "otp_selector");
@@ -428,22 +435,142 @@ export class AccessibilityScanner {
     await page.waitForTimeout(1500);
   }
 
+  // ── DIAGNOSTIC waitForOtpPage ─────────────────────────────────────────────
+  // Logs URL changes, page state, and captures a failure screenshot if OTP
+  // never appears. Replaces the silent 30-second timeout.
   private async waitForOtpPage(page: any, auth: any, timeout = 30000): Promise<void> {
     const otpSelector = this.authSelector(auth, "otp_selector");
     const otpSourceSelector = this.authSelector(auth, "otp_source_selector");
+    const passwordSelector = this.authSelector(auth, "password_selector");
     const deadline = Date.now() + timeout;
+
+    const startUrl = page.url();
+    logger.info(`[OTP-WAIT] Starting OTP detection. Current URL: ${startUrl}`);
+    logger.info(`[OTP-WAIT] OTP source selector: '${(otpSourceSelector || "").slice(0, 120)}'`);
+    logger.info(`[OTP-WAIT] OTP input selector:  '${(otpSelector || "").slice(0, 120)}'`);
+    logger.info(`[OTP-WAIT] otp_from_page: ${Boolean(auth?.otp_from_page)}, otp_code preset: ${Boolean(auth?.otp_code)}`);
+
+    let pollCount = 0;
     while (Date.now() < deadline) {
+      pollCount++;
       const hasOtpText = Boolean(await this.resolveOtpValue(page, auth, 1000).catch(() => ""));
       const hasOtpInput = await this.hasVisibleAuthControl(page, otpSelector).catch(() => false);
       const hasSource = await this.hasVisibleAuthControl(page, otpSourceSelector).catch(() => false);
+
       if (hasOtpText || hasOtpInput || hasSource) {
+        logger.info(`[OTP-WAIT] OTP page detected after ${pollCount} polls (~${Math.round(pollCount * 0.7)}s). otpText=${hasOtpText}, otpInput=${hasOtpInput}, otpSource=${hasSource}`);
         this.onProgress(17, "SUCCESS: OTP page detected");
         return;
       }
+
+      // Diagnostic snapshot every 5 polls (~3.5s)
+      if (pollCount % 5 === 0) {
+        const currentUrl = page.url();
+        const passwordStillVisible = await this.hasVisibleAuthControl(page, passwordSelector).catch(() => false);
+        const cookieStillVisible = await this.hasCookieConsentPrompt(page).catch(() => false);
+        logger.info(`[OTP-WAIT] Poll ${pollCount}: URL=${currentUrl}, passwordVisible=${passwordStillVisible}, cookieVisible=${cookieStillVisible}, otpInput=${hasOtpInput}, otpSource=${hasSource}`);
+      }
+
       await page.waitForLoadState("domcontentloaded", { timeout: 1000 }).catch(() => undefined);
       await page.waitForTimeout(700);
     }
-    throw new Error("OTP page did not appear after clicking Accedi.");
+
+    // ── Detailed failure diagnostics ──────────────────────────────────────
+    const failureUrl = page.url();
+    const passwordStillVisible = await this.hasVisibleAuthControl(page, passwordSelector).catch(() => false);
+    const cookieStillVisible = await this.hasCookieConsentPrompt(page).catch(() => false);
+
+    // Look for Italian / English error messages on the page (including shadow DOM)
+    const errorMessage: string | null = await page.evaluate(() => {
+      const errorPatterns = /password errata|password non corretta|email non valida|account bloccato|account sospeso|credenziali non valide|troppe richieste|too many attempts|account locked|invalid credentials|wrong password|incorrect|errore|riprova|non riusciamo|servizio non disponibile|qualcosa è andato storto|sessione scaduta/i;
+      const collectText = (container: Document | ShadowRoot | Element): string => {
+        const ownText = container instanceof Document
+          ? (container.body?.innerText || container.body?.textContent || "")
+          : ((container as HTMLElement).innerText || (container as Element).textContent || "");
+        let shadowText = "";
+        try {
+          const children = Array.from((container as Document | ShadowRoot | Element).querySelectorAll?.("*") || []);
+          shadowText = children
+            .map(child => (child as HTMLElement).shadowRoot ? collectText((child as HTMLElement).shadowRoot!) : "")
+            .join(" ");
+        } catch { /* ignore */ }
+        return `${ownText} ${shadowText}`;
+      };
+      const allText = collectText(document);
+      const match = allText.match(errorPatterns);
+      if (!match) return null;
+      const idx = allText.toLowerCase().indexOf(match[0].toLowerCase());
+      return allText.substring(Math.max(0, idx - 80), Math.min(allText.length, idx + 160)).replace(/\s+/g, " ").trim();
+    }).catch(() => null);
+
+    // List visible interactive controls so we can see what page we're actually on
+    const visibleControls: string[] = await page.evaluate(() => {
+      const isVisible = (el: Element) => {
+        const rect = (el as HTMLElement).getBoundingClientRect();
+        const style = window.getComputedStyle(el as HTMLElement);
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+      };
+      const collect = (container: Document | ShadowRoot | Element): Element[] => {
+        const direct = Array.from((container as Document | ShadowRoot | Element).querySelectorAll("button,[role='button'],input,a[href]"));
+        const nested = Array.from((container as Document | ShadowRoot | Element).querySelectorAll("*"))
+          .flatMap(child => (child as HTMLElement).shadowRoot ? collect((child as HTMLElement).shadowRoot!) : []);
+        return [...direct, ...nested];
+      };
+      return collect(document)
+        .filter(isVisible)
+        .map(el => {
+          const tag = el.tagName.toLowerCase();
+          const type = (el as HTMLInputElement).type || "";
+          const label = ((el as HTMLElement).innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("placeholder") || el.getAttribute("name") || "").replace(/\s+/g, " ").trim().slice(0, 50);
+          return `${tag}${type ? `[type=${type}]` : ""}${label ? `: "${label}"` : ""}`;
+        })
+        .slice(0, 15);
+    }).catch(() => []);
+
+    // Capture screenshot at moment of failure and store as a diagnostic snapshot
+    let screenshotInfo = "screenshot capture failed";
+    try {
+      const buf = await page.screenshot({ type: "jpeg", quality: 60, fullPage: false });
+      screenshotInfo = `screenshot captured (${Math.round(buf.length / 1024)}KB) — visible in Live DOM / UI States tab as 'otp-failure-diagnostic'`;
+      this.domSnapshots.push({
+        url: failureUrl,
+        phase: "otp-failure-diagnostic",
+        state: "otp-failure-diagnostic",
+        a11yTree: null,
+        screenshot: `data:image/jpeg;base64,${buf.toString("base64")}`,
+      });
+    } catch (err) {
+      logger.debug(`Failure screenshot capture failed: ${(err as Error).message}`);
+    }
+
+    // Log a clear diagnostic summary
+    logger.error(`[OTP-WAIT] ============================================================`);
+    logger.error(`[OTP-WAIT] OTP detection FAILED after ${pollCount} polls (${timeout}ms).`);
+    logger.error(`[OTP-WAIT]   Start URL:    ${startUrl}`);
+    logger.error(`[OTP-WAIT]   Failure URL:  ${failureUrl}`);
+    logger.error(`[OTP-WAIT]   URL changed:  ${startUrl !== failureUrl ? "YES" : "NO — login likely never submitted or rejected immediately"}`);
+    logger.error(`[OTP-WAIT]   Password field still visible: ${passwordStillVisible ? "YES — login form did not advance" : "NO"}`);
+    logger.error(`[OTP-WAIT]   Cookie banner still visible:  ${cookieStillVisible ? "YES — banner may have blocked submission" : "NO"}`);
+    logger.error(`[OTP-WAIT]   Error message detected:       ${errorMessage || "none"}`);
+    logger.error(`[OTP-WAIT]   Visible controls on page:    ${visibleControls.length ? visibleControls.join(" | ") : "none captured"}`);
+    logger.error(`[OTP-WAIT]   ${screenshotInfo}`);
+    logger.error(`[OTP-WAIT] ============================================================`);
+
+    // Build a useful error message that tells the user what to look at
+    let diagnosticHint = "";
+    if (errorMessage) {
+      diagnosticHint = ` — Page shows error: "${errorMessage}"`;
+    } else if (passwordStillVisible) {
+      diagnosticHint = " — Password field is STILL visible after submit. The Accedi click likely did not fire, OR credentials were rejected silently. Check the diagnostic screenshot in the UI States tab.";
+    } else if (cookieStillVisible) {
+      diagnosticHint = " — Cookie banner is still visible and is likely blocking the OTP page from rendering. Check cookie_accept_selector configuration.";
+    } else if (startUrl === failureUrl) {
+      diagnosticHint = " — URL did not change after Accedi click. Form submission may have failed silently. Check the diagnostic screenshot.";
+    } else {
+      diagnosticHint = ` — URL changed to ${failureUrl} but no OTP input/source was found. Either OTP selectors are outdated for the current Sky page structure, OR this account is not gated by OTP (login completed without requiring OTP).`;
+    }
+
+    throw new Error(`OTP page did not appear after clicking Accedi.${diagnosticHint}`);
   }
 
   private selectorCandidates(selectorList?: string): string[] {
