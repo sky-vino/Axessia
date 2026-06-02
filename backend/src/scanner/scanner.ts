@@ -322,111 +322,46 @@ export class AccessibilityScanner {
         throw new Error(`Login password field was not found, was not filled, or did not retain the value with selector: ${passwordSelector}`);
       }
       logger.info(`[LOGIN-DIAG] Password field filled and verified.`);
-      logger.error(
-  "######## ENTER SUBMIT TEST BUILD 20260602 ########"
-);
+      this.onProgress(16, "SUCCESS: Password entered");
 
-await page.keyboard.press("Tab").catch(() => undefined);
-await page.waitForTimeout(500);
+      if (auth.auto_accept_cookies !== false) {
+        await this.waitAndClearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"), 8000);
+      }
 
-logger.info(`[LOGIN-DIAG] TAB pressed after password entry`);
+      const readyToSubmit =
+        await this.verifyFieldValue(page, usernameSelector, auth.username || "") &&
+        await this.verifyFieldValue(page, passwordSelector, auth.password || "");
 
-this.onProgress(16, "SUCCESS: Password entered");
+      if (!readyToSubmit) {
+        throw new Error("Refusing to click Accedi because username/password are not both verified immediately before submit.");
+      }
 
-if (auth.auto_accept_cookies !== false)
-  await this.waitAndClearCookieConsent(
-    page,
-    this.authSelector(auth, "cookie_accept_selector"),
-    8000
-  );
+      this.attachLoginNetworkDiagnostics(page);
 
-const readyToSubmit =
-  await this.verifyFieldValue(page, usernameSelector, auth.username || "") &&
-  await this.verifyFieldValue(page, passwordSelector, auth.password || "");
+      logger.info(`[LOGIN-DIAG] Before Accedi click URL: ${page.url()}`);
+      const errorBeforeClick = await this.getVisibleLoginError(page);
+      logger.info(`[LOGIN-PROOF] Before Accedi click: url=${page.url()}, visibleLoginError=${errorBeforeClick || "none"}`);
+      await this.captureLoginProofSnapshot(page, "before-accedi-click", errorBeforeClick);
 
-if (!readyToSubmit) {
-  throw new Error(
-    "Refusing to click Accedi because username/password are not both verified immediately before submit."
-  );
-}
+      logger.info(`[LOGIN-DIAG] Clicking configured Accedi submit control.`);
+      const clickStartedAt = Date.now();
+      const submitted = await this.tryClickFirst(page, submitSelector);
+      if (!submitted) {
+        throw new Error(`Accedi submit button was not found or not clickable with selector: ${submitSelector}`);
+      }
 
-// ====================================================
-// LOGIN NETWORK DIAGNOSTICS
-// ====================================================
+      this.onProgress(17, "SUCCESS: Accedi clicked");
+      await this.waitForLoginTransition(page, auth, loginUrl, Math.max(12000, Number(auth.post_login_wait_ms || 0)));
 
-page.on("request", request => {
-  const url = request.url();
+      const loginError = await this.getVisibleLoginError(page);
+      logger.info(`[LOGIN-PROOF] After Accedi click + ${Date.now() - clickStartedAt}ms: url=${page.url()}, visibleLoginError=${loginError || "none"}`);
+      await this.captureLoginProofSnapshot(page, "after-accedi-click", loginError);
+      if (loginError) {
+        throw new Error(`Sky rejected the login after Accedi: ${loginError}`);
+      }
 
-  if (
-    url.includes("cronus") ||
-    url.includes("login") ||
-    url.includes("auth")
-  ) {
-    logger.info(
-      `[LOGIN-NET][REQ] ${request.method()} ${url}`
-    );
-  }
-});
-
-page.on("response", response => {
-  const url = response.url();
-
-  if (
-    url.includes("cronus") ||
-    url.includes("login") ||
-    url.includes("auth")
-  ) {
-    logger.info(
-      `[LOGIN-NET][RES] ${response.status()} ${url}`
-    );
-  }
-});
-
-logger.info(
-  `[STEP-1] BEFORE CLICK URL = ${page.url()}`
-);
-
-logger.info(
-  `[LOGIN-DIAG] About to click Accedi (submit) button.`
-);
-
-await page.keyboard.press("Tab");
-await page.waitForTimeout(500);
-
-await page.keyboard.press("Space");
-await page.waitForTimeout(2000);
-
-await page.keyboard.press("Enter");
-
-logger.info(
-  `[LOGIN-DIAG] Pressing ENTER instead of clicking submit`
-);
-
-await page.keyboard.press("Enter");
-
-logger.info(
-  `[STEP-2] AFTER CLICK URL = ${page.url()}`
-);
-
-await page.waitForTimeout(1000);
-
-logger.info(
-  `[STEP-3] AFTER 1 SEC URL = ${page.url()}`
-);
-
-logger.info(
-  `[LOGIN-DIAG] ENTER key submitted login`
-);
-
-await this.waitForLoginTransition(page, auth, loginUrl, 5000);
-
-const urlAfterSubmit = page.url();
-
-logger.info(
-  `[LOGIN-DIAG] After Accedi click + transition wait. URL: ${urlAfterSubmit} (changed: ${
-    urlAfterSubmit !== loginUrl ? "YES" : "NO"
-  })`
-);
+      const urlAfterSubmit = page.url();
+      logger.info(`[LOGIN-DIAG] After Accedi transition wait. URL: ${urlAfterSubmit} (changed: ${urlAfterSubmit !== loginUrl ? "YES" : "NO"})`);
       if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
 
       const otpSelector = this.authSelector(auth, "otp_selector");
@@ -503,10 +438,80 @@ logger.info(
   private async waitForLoginTransition(page: any, auth: any, loginUrl: string, timeout = 5000): Promise<void> {
     await Promise.race([
       page.waitForURL((url: URL) => url.href !== loginUrl, { timeout }).catch(() => undefined),
-      page.waitForLoadState("domcontentloaded", { timeout }).catch(() => undefined),
+      page.waitForLoadState("networkidle", { timeout }).catch(() => undefined),
       page.waitForTimeout(timeout)
     ]);
+    await page.waitForTimeout(1800).catch(() => undefined);
     await page.waitForLoadState("load", { timeout: 5000 }).catch(() => undefined);
+  }
+
+  private attachLoginNetworkDiagnostics(page: any): void {
+    page.on("request", (request: any) => {
+      const url = request.url();
+      if (/cronus|login|auth|otp|skyid/i.test(url)) {
+        logger.info(`[LOGIN-NET][REQ] ${request.method()} ${url}`);
+      }
+    });
+
+    page.on("response", (response: any) => {
+      const url = response.url();
+      if (/cronus|login|auth|otp|skyid/i.test(url)) {
+        logger.info(`[LOGIN-NET][RES] ${response.status()} ${url}`);
+      }
+    });
+  }
+
+  private async captureLoginProofSnapshot(page: any, phase: string, visibleError?: string | null): Promise<void> {
+    try {
+      const buf = await page.screenshot({ type: "jpeg", quality: 68, fullPage: false });
+      this.domSnapshots.push({
+        url: page.url(),
+        phase,
+        state: phase,
+        a11yTree: {
+          proof: "Accedi click diagnostic",
+          visibleLoginError: visibleError || null,
+          capturedAt: new Date().toISOString(),
+        },
+        screenshot: `data:image/jpeg;base64,${buf.toString("base64")}`,
+      });
+      logger.info(`[LOGIN-PROOF] Screenshot captured for ${phase} (${Math.round(buf.length / 1024)}KB).`);
+    } catch (err) {
+      logger.warn(`[LOGIN-PROOF] Screenshot capture failed for ${phase}: ${(err as Error)?.message || err}`);
+    }
+  }
+
+  private async getVisibleLoginError(page: any): Promise<string | null> {
+    return page.evaluate(() => {
+      const errorPattern = /si e verificato un problema durante l'accesso|si e verificato un problema durante l.accesso|problema durante l.accesso|contatta il servizio clienti sky|password errata|password non corretta|email non valida|credenziali non valide|troppe richieste|account bloccato|account sospeso|servizio non disponibile|sessione scaduta|invalid credentials|wrong password|too many attempts|account locked/i;
+      const normalize = (value: string) =>
+        String(value || "")
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+      const isVisible = (el: Element) => {
+        const rect = (el as HTMLElement).getBoundingClientRect();
+        const style = window.getComputedStyle(el as HTMLElement);
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+      };
+      const collectElements = (container: Document | ShadowRoot | Element): Element[] => {
+        const direct = Array.from((container as Document | ShadowRoot | Element).querySelectorAll?.("*") || []);
+        const nested = direct.flatMap(child => (child as HTMLElement).shadowRoot ? collectElements((child as HTMLElement).shadowRoot!) : []);
+        return [...direct, ...nested];
+      };
+
+      const candidates = collectElements(document)
+        .filter(isVisible)
+        .map(el => normalize((el as HTMLElement).innerText || el.textContent || ""))
+        .filter(Boolean);
+
+      const match = candidates.find(text => errorPattern.test(text));
+      if (!match) return null;
+      const found = match.match(errorPattern)?.[0] || match;
+      const idx = match.toLowerCase().indexOf(found.toLowerCase());
+      return match.substring(Math.max(0, idx - 80), Math.min(match.length, idx + 180));
+    }).catch(() => null);
   }
 
   private async waitForPostLoginReady(page: any, auth: any, loginUrl: string): Promise<void> {
