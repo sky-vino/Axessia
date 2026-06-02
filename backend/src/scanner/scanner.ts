@@ -322,12 +322,6 @@ export class AccessibilityScanner {
         throw new Error(`Login password field was not found, was not filled, or did not retain the value with selector: ${passwordSelector}`);
       }
       logger.info(`[LOGIN-DIAG] Password field filled and verified.`);
-      await page.keyboard.press("Tab").catch(() => undefined);
-await page.waitForTimeout(500);
-
-logger.info(
-  `[LOGIN-DIAG] TAB pressed after password entry`
-);
       this.onProgress(16, "SUCCESS: Password entered");
 
       if (auth.auto_accept_cookies !== false) await this.waitAndClearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"), 8000);
@@ -335,107 +329,7 @@ logger.info(
       if (!readyToSubmit) {
         throw new Error("Refusing to click Accedi because username/password are not both verified immediately before submit.");
       }
-      // =====================================================
-// LOGIN NETWORK DIAGNOSTICS
-// =====================================================
-page.on("request", request => {
-  const url = request.url();
-
-  logger.info(
-    `[LOGIN-NET][REQ] ${request.method()} ${url}`
-  );
-
-  if (url.includes("/cronus/")) {
-    logger.info(
-      `[CRONUS][REQ] ${request.method()} ${url}`
-    );
-  }
-});
-
-page.on("response", async response => {
-  const url = response.url();
-
-  logger.info(
-    `[LOGIN-NET][RES] ${response.status()} ${url}`
-  );
-
-  if (url.includes("/cronus/")) {
-    logger.info(
-      `[CRONUS][RES] ${response.status()} ${url}`
-    );
-
-    try {
-      const body = await response.text();
-      logger.info(
-        `[CRONUS][BODY] ${body.substring(0, 1000)}`
-      );
-    } catch {
-      logger.info(
-        `[CRONUS][BODY] Unable to read response body`
-      );
-    }
-  }
-});
-
-page.on("console", msg => {
-  logger.info(
-    `[LOGIN-CONSOLE] ${msg.type()} ${msg.text()}`
-  );
-});
-
-page.on("pageerror", err => {
-  logger.error(
-    `[LOGIN-PAGEERROR] ${err.message}`
-  );
-});
-
-logger.info(`[STEP-1] BEFORE CLICK URL = ${page.url()}`);
-const submittedPassword = await this.tryClickFirst(page, submitSelector);
-      logger.info(
-  `[STEP-2] AFTER CLICK URL = ${page.url()}`
-);
-
-await page.waitForTimeout(1000);
-logger.info(
-  `[STEP-3] AFTER 1 SEC URL = ${page.url()}`
-);
-
-await page.waitForTimeout(2000);
-logger.info(
-  `[STEP-4] AFTER 3 SEC URL = ${page.url()}`
-);
-
-await page.waitForTimeout(2000);
-logger.info(
-  `[STEP-5] AFTER 5 SEC URL = ${page.url()}`
-);
-
-// Check if Cronus login endpoint is ever called
-const cronusHit = await page.waitForResponse(
-  r => r.url().includes("/cronus/v2/user/login"),
-  { timeout: 10000 }
-).then(() => true).catch(() => false);
-
-logger.info(
-  `[CRONUS-CHECK] /cronus/v2/user/login called = ${cronusHit}`
-);
-
-// Screenshot immediately after submit
-try {
-  const buf = await page.screenshot({
-    type: "jpeg",
-    quality: 60,
-    fullPage: false
-  });
-
-  logger.info(
-    `[LOGIN-DIAG] After-click screenshot captured (${Math.round(buf.length / 1024)} KB)`
-  );
-} catch (err) {
-  logger.warn(
-    `[LOGIN-DIAG] Failed to capture after-click screenshot`
-  );
-}
+      logger.info(`[LOGIN-DIAG] About to click Accedi (submit) button.`);
       const submittedPassword = await this.tryClickFirst(page, submitSelector);
       logger.info(`[LOGIN-DIAG] Accedi click result: ${submittedPassword ? "clicked via selector" : "fallback to keyboard Enter"}`);
       if (!submittedPassword) await page.keyboard.press("Enter").catch(() => undefined);
