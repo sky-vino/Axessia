@@ -23,16 +23,6 @@ jobs:
         with:
           node-version: '22.x'
 
-      - name: Install backend dependencies
-        run: |
-          cd backend
-          npm install
-
-      - name: Build backend
-        run: |
-          cd backend
-          npm run build
-
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
