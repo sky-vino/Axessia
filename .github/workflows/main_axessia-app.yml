@@ -45,9 +45,9 @@ jobs:
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_775F45F31B0A4D18BD5E599649E39A0F }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_3E6639BEF51C44FF93DAFCB2530494B3 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_4B6DB77405BB47009559EA83F0163C40 }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_A0EB6D60FBFC4E04A9BAFEDF48CFBCAF }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_E6DC03BC33C04A7BBA003BC60D250149 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_2E62344A18C645C8B18C606838EEDE37 }}
 
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
@@ -55,4 +55,5 @@ jobs:
         with:
           app-name: 'axessia-app'
           slot-name: 'Production'
-          package: .          
+          package: .
+          
