@@ -393,6 +393,11 @@ logger.info(
 await page.keyboard.press("Tab");
 await page.waitForTimeout(500);
 
+await page.keyboard.press("Space");
+await page.waitForTimeout(2000);
+
+await page.keyboard.press("Enter");
+
 logger.info(
   `[LOGIN-DIAG] Pressing ENTER instead of clicking submit`
 );
