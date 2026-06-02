@@ -33,6 +33,7 @@ export interface ScanResult {
   issues: ScanIssue[];
   testCases: TestCase[];
   domSnapshots: DomSnapshot[];
+  navigatedUrls: string[];
   score: number;
 }
 
@@ -43,6 +44,8 @@ export class AccessibilityScanner {
   private testCases: TestCase[] = [];
   private domSnapshots: DomSnapshot[] = [];
   private scannedPageKeys = new Set<string>();
+  private navigatedUrls: string[] = [];
+  private navigatedUrlKeys = new Set<string>();
 
   constructor(scan: any, onProgress: ProgressCallback) {
     this.scan = scan;
@@ -53,6 +56,8 @@ export class AccessibilityScanner {
     const opts: ScanOptions = { ...this.scan.scan_options };
     const urls: string[] = this.scan.urls || [];
     const authConfig = this.scan.auth_config;
+    const workflowType = opts.workflow_type || authConfig?.workflow_type || "generic";
+    const isSkyWorkflow = workflowType === "sky";
     const extraStates = opts.extra_states || [];
     const scannedEntrypoints = new Set<string>();
 
@@ -69,17 +74,8 @@ export class AccessibilityScanner {
     };
 
     const browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-extensions",
-        "--no-first-run",
-        "--window-size=1366,768",
-      ],
+      headless: false,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
     });
 
     try {
@@ -94,19 +90,14 @@ export class AccessibilityScanner {
               const loginPage = await loginContext.newPage();
               try {
                 progress(`Scanning login page before authentication: ${authConfig.login_url}`);
-                const ok = await navigateSafely(loginPage, authConfig.login_url);
+                  this.trackPageNavigations(loginPage, "login page");
+                  const ok = await this.navigateAndRecord(loginPage, authConfig.login_url, "login page");
                 if (ok) {
                   await loginPage.waitForTimeout(1200);
                   if (authConfig.auto_accept_cookies !== false) {
                     await this.clearCookieConsentWithProgress(loginPage, this.authSelector(authConfig, "cookie_accept_selector"), progress, "login page");
                   }
-                  await this.runFullPageScan(
-                    loginPage,
-                    authConfig.login_url,
-                    { ...opts, run_states: false },
-                    [],
-                    progress
-                  );
+                  await this.runFullPageScan(loginPage, authConfig.login_url, opts, extraStates, progress);
                   scannedEntrypoints.add(loginKey);
                 }
               } catch (err) {
@@ -116,12 +107,13 @@ export class AccessibilityScanner {
               }
             }
             //Creates browser context and waits till login authentication is completed
-            const context = await this.createBrowserContext(browser, opts);
-            const page = await context.newPage();
-            try {
-              progress(`Authenticating with OTP flow for ${url}`);
+              const context = await this.createBrowserContext(browser, opts);
+              const page = await context.newPage();
+              this.trackPageNavigations(page, "authenticated session");
+              try {
+              progress(isSkyWorkflow ? `Authenticating with Sky login and OTP flow for ${url}` : `Authenticating with generic login flow for ${url}`);
               const landedUrl = await this.handleLogin(page, authConfig);
-              progress(`SUCCESS: Login and OTP completed; landed on ${landedUrl}`);
+              progress(isSkyWorkflow ? `SUCCESS: Sky login and OTP completed; landed on ${landedUrl}` : `SUCCESS: Login completed; landed on ${landedUrl}`);
               const landedKey = canonicalUrlKey(landedUrl) || landedUrl;
               const landedAuthKey = `auth:${landedKey}`;
 
@@ -131,31 +123,33 @@ export class AccessibilityScanner {
                 await this.runFullPageScan(page, landedUrl, opts, extraStates, progress);
                 progress(`SUCCESS: Completed authenticated landing scan`);
                 scannedEntrypoints.add(landedAuthKey);
-                if (opts.post_login_tab_scan !== false) {
+                if (isSkyWorkflow && opts.post_login_tab_scan !== false) {
                   const tabLimit = Math.min(Math.max(1, opts.post_login_tab_limit ?? 12), 30);
                   await this.scanLinkedPageStates(page, landedUrl, opts, extraStates, progress, tabLimit);
                 }
               }
 
-              const profileUrl = authConfig.profile_url || url;
+              const profileUrl = isSkyWorkflow ? (authConfig.profile_url || url) : url;
               const profileKey = canonicalUrlKey(profileUrl) || profileUrl;
               const profileAuthKey = `auth:${profileKey}`;
               if (profileUrl && !scannedEntrypoints.has(profileAuthKey)) {
-                progress(`Opening authenticated profile page: ${profileUrl}`);
-                const ok = await navigateSafely(page, profileUrl);
+                progress(isSkyWorkflow ? `Opening authenticated profile/Gestisci page: ${profileUrl}` : `Opening authenticated target page: ${profileUrl}`);
+                const ok = await this.navigateAndRecord(page, profileUrl, "authenticated profile/Gestisci page");
                 if (!ok) throw new Error(`Authenticated profile page is unreachable: ${profileUrl}`);
                 await page.waitForTimeout(1500);
                 await this.ensureAuthenticatedPage(page, authConfig, profileUrl);
                 await this.runFullPageScan(page, profileUrl, opts, extraStates, progress);
-                progress(`SUCCESS: Completed authenticated profile/Gestisci scan`);
+                progress(isSkyWorkflow ? `SUCCESS: Completed authenticated profile/Gestisci scan` : `SUCCESS: Completed authenticated target scan`);
                 scannedEntrypoints.add(profileAuthKey);
-                if (opts.post_login_tab_scan !== false) {
+                if (isSkyWorkflow && opts.post_login_tab_scan !== false) {
                   const tabLimit = Math.min(Math.max(1, opts.post_login_tab_limit ?? 12), 30);
                   await this.scanLinkedPageStates(page, profileUrl, opts, extraStates, progress, tabLimit);
                 }
               }
 
-              await this.scanConfiguredPostLoginPages(page, profileUrl || landedUrl || url, opts, extraStates, progress, scannedEntrypoints, authConfig);
+              if (isSkyWorkflow) {
+                await this.scanConfiguredPostLoginPages(page, profileUrl || landedUrl || url, opts, extraStates, progress, scannedEntrypoints, authConfig);
+              }
 
               const targetKey = canonicalUrlKey(url) || url;
               const targetAuthKey = `auth:${targetKey}`;
@@ -163,7 +157,7 @@ export class AccessibilityScanner {
                 await this.runCrawlBfsForSeed(page, url, opts, extraStates, progress);
               } else if (!scannedEntrypoints.has(targetAuthKey)) {
                 progress(`Navigating to authenticated target ${url}`);
-                const ok = await navigateSafely(page, url);
+                const ok = await this.navigateAndRecord(page, url, "authenticated target");
                 if (!ok) {
                   logger.warn(`Skipping unreachable URL: ${url}`);
                   continue;
@@ -172,7 +166,9 @@ export class AccessibilityScanner {
                 await this.ensureAuthenticatedPage(page, authConfig, url);
                 await this.runFullPageScan(page, url, opts, extraStates, progress);
                 scannedEntrypoints.add(targetAuthKey);
-                await this.scanLinkedPageStates(page, url, opts, extraStates, progress);
+                if (isSkyWorkflow) {
+                  await this.scanLinkedPageStates(page, url, opts, extraStates, progress);
+                }
               }
             } finally {
               await context.close();
@@ -183,19 +179,22 @@ export class AccessibilityScanner {
 
           const context = await this.createBrowserContext(browser, opts);
           const page = await context.newPage();
+          this.trackPageNavigations(page, "scan page");
           try {
             if (opts.crawl_mode) {
               await this.runCrawlBfsForSeed(page, url, opts, extraStates, progress);
             } else {
               progress(`Navigating to ${url}`);
-              const ok = await navigateSafely(page, url);
+              const ok = await this.navigateAndRecord(page, url, "scan target");
               if (!ok) {
                 logger.warn(`Skipping unreachable URL: ${url}`);
                 continue;
               }
               await page.waitForTimeout(1200);
               await this.runFullPageScan(page, url, opts, extraStates, progress);
-              await this.scanLinkedPageStates(page, url, opts, extraStates, progress);
+              if (isSkyWorkflow) {
+                await this.scanLinkedPageStates(page, url, opts, extraStates, progress);
+              }
             }
           } finally {
             await context.close();
@@ -213,33 +212,56 @@ export class AccessibilityScanner {
     this.generateTestCases();
     this.generateManualHybridReviewCases();
     const score = this.computeScore(this.allIssues);
+    logger.info(`Scan navigation trail (${this.navigatedUrls.length} URL${this.navigatedUrls.length === 1 ? "" : "s"}): ${this.navigatedUrls.join(" -> ") || "none recorded"}`);
     logger.info(`Scan complete: ${this.allIssues.length} issues, score ${score}`);
-    return { issues: this.allIssues, testCases: this.testCases, domSnapshots: this.domSnapshots, score };
+    return { issues: this.allIssues, testCases: this.testCases, domSnapshots: this.domSnapshots, navigatedUrls: this.navigatedUrls, score };
   }
 
   private async createBrowserContext(browser: any, opts: ScanOptions): Promise<any> {
-    const context = await browser.newContext({
+    return browser.newContext({
       viewport: { width: opts.viewport_width || 1366, height: opts.viewport_height || 768 },
       ignoreHTTPSErrors: true,
-      locale: "it-IT",
-      timezoneId: "Europe/Rome",
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      extraHTTPHeaders: {
-        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-      },
-      colorScheme: "light",
+      locale: "en-US",
     });
-    await context.addInitScript(() => {
-      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-      Object.defineProperty(navigator, "languages", { get: () => ["it-IT", "it", "en-US", "en"] });
-      Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, "platform", { get: () => "Win32" });
+  }
+
+  private trackPageNavigations(page: any, context: string): void {
+    page.on("request", (request: any) => {
+      try {
+        if (request.isNavigationRequest?.() && request.resourceType?.() === "document" && request.frame?.() === page.mainFrame()) {
+          this.recordNavigatedUrl(request.url(), `${context} document request`);
+        }
+      } catch { /* ignore navigation observer errors */ }
     });
-    return context;
+    page.on("framenavigated", (frame: any) => {
+      try {
+        if (frame === page.mainFrame()) {
+          this.recordNavigatedUrl(frame.url(), context);
+        }
+      } catch { /* ignore navigation observer errors */ }
+    });
+  }
+
+  private recordNavigatedUrl(rawUrl: string, context: string): void {
+    const url = String(rawUrl || "").trim();
+    if (!url || url === "about:blank") return;
+    const key = url;
+    if (this.navigatedUrlKeys.has(key)) return;
+    this.navigatedUrlKeys.add(key);
+    this.navigatedUrls.push(url);
+    logger.info(`Scan navigated through URL (${context}): ${url}`);
+  }
+
+  private async navigateAndRecord(page: any, url: string, context: string): Promise<boolean> {
+    this.recordNavigatedUrl(url, `${context} requested`);
+    const ok = await navigateSafely(page, url);
+    this.recordNavigatedUrl(page.url(), `${context} reached`);
+    return ok;
   }
 
   private async handleLogin(page: any, auth: any): Promise<string> {
     try {
+      const isSkyWorkflow = auth?.workflow_type === "sky";
       const usernameSelector = this.authSelector(auth, "username_selector");
       const passwordSelector = this.authSelector(auth, "password_selector");
       const submitSelector = this.authSelector(auth, "submit_selector");
@@ -247,11 +269,11 @@ export class AccessibilityScanner {
       if (!passwordSelector) throw new Error("Password field selector is required for authenticated scans.");
       if (!submitSelector) throw new Error("Login submit selector is required for authenticated scans.");
 
-      await navigateSafely(page, auth.login_url);
-      await this.waitForSkyLoginReady(page);
+      await this.navigateAndRecord(page, auth.login_url, "login");
+      if (isSkyWorkflow) await this.waitForSkyLoginReady(page);
+      else await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => undefined);
       if (auth.auto_accept_cookies !== false) await this.waitAndClearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"), 12000);
       const loginUrl = page.url();
-      logger.info(`[LOGIN-DIAG] Login page loaded. URL: ${loginUrl}`);
 
       logger.info(`Using configured login selectors: username='${usernameSelector}', password='${passwordSelector}', submit='${submitSelector}'`);
 
@@ -260,7 +282,6 @@ export class AccessibilityScanner {
       if (!usernameVerified) {
         throw new Error(`Login username field was not found, was not filled, or did not retain the value with selector: ${usernameSelector}`);
       }
-      logger.info(`[LOGIN-DIAG] Username field filled and verified.`);
       this.onProgress(12, "SUCCESS: Username entered");
 
       let passwordFilled = await this.tryFillFirst(page, passwordSelector, auth.password || "", 12000);
@@ -269,7 +290,6 @@ export class AccessibilityScanner {
       if (!passwordVerified) {
         throw new Error(`Login password field was not found, was not filled, or did not retain the value with selector: ${passwordSelector}`);
       }
-      logger.info(`[LOGIN-DIAG] Password field filled and verified.`);
       this.onProgress(16, "SUCCESS: Password entered");
 
       if (auth.auto_accept_cookies !== false) await this.waitAndClearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"), 8000);
@@ -277,45 +297,44 @@ export class AccessibilityScanner {
       if (!readyToSubmit) {
         throw new Error("Refusing to click Accedi because username/password are not both verified immediately before submit.");
       }
-      logger.info(`[LOGIN-DIAG] About to click Accedi (submit) button.`);
       const submittedPassword = await this.tryClickFirst(page, submitSelector);
-      logger.info(`[LOGIN-DIAG] Accedi click result: ${submittedPassword ? "clicked via selector" : "fallback to keyboard Enter"}`);
       if (!submittedPassword) await page.keyboard.press("Enter").catch(() => undefined);
       await this.waitForLoginTransition(page, auth, loginUrl, 5000);
-      const urlAfterSubmit = page.url();
-      logger.info(`[LOGIN-DIAG] After Accedi click + transition wait. URL: ${urlAfterSubmit} (changed: ${urlAfterSubmit !== loginUrl ? "YES" : "NO"})`);
       if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
 
       const otpSelector = this.authSelector(auth, "otp_selector");
       const otpSubmitSelector = this.authSelector(auth, "otp_submit_selector");
-      await this.waitForOtpPage(page, auth, 30000);
-      const otpValue = await this.resolveOtpValue(page, auth, 30000);
-      const otpControlVisible = await this.hasVisibleAuthControl(page, otpSelector);
-      if (otpSelector && otpControlVisible && !otpValue) {
-        throw new Error("OTP input is visible, but no OTP value could be resolved from the configured page selector or manual OTP code.");
-      }
-      if (otpSelector && otpValue) {
-        try {
-          await this.fillOtpInputs(page, otpSelector, otpValue, Math.min(auth.post_login_wait_ms || 8000, 15000));
-          const otpVerified = await this.verifyOtpInputs(page, otpSelector, otpValue);
-          if (!otpVerified) throw new Error("OTP fields did not retain all expected digits.");
-          this.onProgress(18, "SUCCESS: OTP entered");
-          if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
-          if (otpSubmitSelector) await this.clickFirst(page, otpSubmitSelector);
-          else {
-            const submittedOtp = await this.tryClickFirst(page, submitSelector);
-            if (!submittedOtp) await page.keyboard.press("Enter").catch(() => undefined);
+      const shouldHandleOtp = isSkyWorkflow || Boolean(auth.otp_code) || Boolean(auth.otp_from_page && this.authSelector(auth, "otp_source_selector")) || Boolean(otpSelector && otpSubmitSelector);
+      if (shouldHandleOtp) {
+        await this.waitForOtpPage(page, auth, isSkyWorkflow ? 30000 : 10000);
+        const otpValue = await this.resolveOtpValue(page, auth, isSkyWorkflow ? 30000 : 10000);
+        const otpControlVisible = await this.hasVisibleAuthControl(page, otpSelector);
+        if (otpSelector && otpControlVisible && !otpValue) {
+          throw new Error("OTP input is visible, but no OTP value could be resolved from the configured page selector or manual OTP code.");
+        }
+        if (otpSelector && otpValue) {
+          try {
+            await this.fillOtpInputs(page, otpSelector, otpValue, Math.min(auth.post_login_wait_ms || 8000, 15000));
+            const otpVerified = await this.verifyOtpInputs(page, otpSelector, otpValue);
+            if (!otpVerified) throw new Error("OTP fields did not retain all expected digits.");
+            this.onProgress(18, "SUCCESS: OTP entered");
+            if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
+            if (otpSubmitSelector) await this.clickFirst(page, otpSubmitSelector);
+            else {
+              const submittedOtp = await this.tryClickFirst(page, submitSelector);
+              if (!submittedOtp) await page.keyboard.press("Enter").catch(() => undefined);
+            }
+            this.onProgress(20, "SUCCESS: OTP confirmed");
+            await this.waitForLoginTransition(page, auth, loginUrl, 5000);
+          } catch (otpErr) {
+            throw new Error(`OTP field was configured but could not be completed: ${(otpErr as Error)?.message || otpErr}`);
           }
-          this.onProgress(20, "SUCCESS: Conferma clicked");
-          await this.waitForLoginTransition(page, auth, loginUrl, 5000);
-        } catch (otpErr) {
-          throw new Error(`OTP field was configured but could not be completed: ${(otpErr as Error)?.message || otpErr}`);
         }
       }
 
       await this.waitForPostLoginReady(page, auth, loginUrl);
       if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
-      if (await this.hasVisibleAuthControl(page, passwordSelector) || await this.hasVisibleAuthControl(page, otpSelector)) {
+      if (await this.hasVisibleAuthControl(page, passwordSelector) || (shouldHandleOtp && await this.hasVisibleAuthControl(page, otpSelector))) {
         throw new Error("Login did not complete; password or OTP controls are still visible.");
       }
       await this.ensureAuthenticatedPage(page, auth, page.url());
@@ -435,142 +454,22 @@ export class AccessibilityScanner {
     await page.waitForTimeout(1500);
   }
 
-  // ── DIAGNOSTIC waitForOtpPage ─────────────────────────────────────────────
-  // Logs URL changes, page state, and captures a failure screenshot if OTP
-  // never appears. Replaces the silent 30-second timeout.
   private async waitForOtpPage(page: any, auth: any, timeout = 30000): Promise<void> {
     const otpSelector = this.authSelector(auth, "otp_selector");
     const otpSourceSelector = this.authSelector(auth, "otp_source_selector");
-    const passwordSelector = this.authSelector(auth, "password_selector");
     const deadline = Date.now() + timeout;
-
-    const startUrl = page.url();
-    logger.info(`[OTP-WAIT] Starting OTP detection. Current URL: ${startUrl}`);
-    logger.info(`[OTP-WAIT] OTP source selector: '${(otpSourceSelector || "").slice(0, 120)}'`);
-    logger.info(`[OTP-WAIT] OTP input selector:  '${(otpSelector || "").slice(0, 120)}'`);
-    logger.info(`[OTP-WAIT] otp_from_page: ${Boolean(auth?.otp_from_page)}, otp_code preset: ${Boolean(auth?.otp_code)}`);
-
-    let pollCount = 0;
     while (Date.now() < deadline) {
-      pollCount++;
       const hasOtpText = Boolean(await this.resolveOtpValue(page, auth, 1000).catch(() => ""));
       const hasOtpInput = await this.hasVisibleAuthControl(page, otpSelector).catch(() => false);
       const hasSource = await this.hasVisibleAuthControl(page, otpSourceSelector).catch(() => false);
-
       if (hasOtpText || hasOtpInput || hasSource) {
-        logger.info(`[OTP-WAIT] OTP page detected after ${pollCount} polls (~${Math.round(pollCount * 0.7)}s). otpText=${hasOtpText}, otpInput=${hasOtpInput}, otpSource=${hasSource}`);
         this.onProgress(17, "SUCCESS: OTP page detected");
         return;
       }
-
-      // Diagnostic snapshot every 5 polls (~3.5s)
-      if (pollCount % 5 === 0) {
-        const currentUrl = page.url();
-        const passwordStillVisible = await this.hasVisibleAuthControl(page, passwordSelector).catch(() => false);
-        const cookieStillVisible = await this.hasCookieConsentPrompt(page).catch(() => false);
-        logger.info(`[OTP-WAIT] Poll ${pollCount}: URL=${currentUrl}, passwordVisible=${passwordStillVisible}, cookieVisible=${cookieStillVisible}, otpInput=${hasOtpInput}, otpSource=${hasSource}`);
-      }
-
       await page.waitForLoadState("domcontentloaded", { timeout: 1000 }).catch(() => undefined);
       await page.waitForTimeout(700);
     }
-
-    // ── Detailed failure diagnostics ──────────────────────────────────────
-    const failureUrl = page.url();
-    const passwordStillVisible = await this.hasVisibleAuthControl(page, passwordSelector).catch(() => false);
-    const cookieStillVisible = await this.hasCookieConsentPrompt(page).catch(() => false);
-
-    // Look for Italian / English error messages on the page (including shadow DOM)
-    const errorMessage: string | null = await page.evaluate(() => {
-      const errorPatterns = /password errata|password non corretta|email non valida|account bloccato|account sospeso|credenziali non valide|troppe richieste|too many attempts|account locked|invalid credentials|wrong password|incorrect|errore|riprova|non riusciamo|servizio non disponibile|qualcosa è andato storto|sessione scaduta/i;
-      const collectText = (container: Document | ShadowRoot | Element): string => {
-        const ownText = container instanceof Document
-          ? (container.body?.innerText || container.body?.textContent || "")
-          : ((container as HTMLElement).innerText || (container as Element).textContent || "");
-        let shadowText = "";
-        try {
-          const children = Array.from((container as Document | ShadowRoot | Element).querySelectorAll?.("*") || []);
-          shadowText = children
-            .map(child => (child as HTMLElement).shadowRoot ? collectText((child as HTMLElement).shadowRoot!) : "")
-            .join(" ");
-        } catch { /* ignore */ }
-        return `${ownText} ${shadowText}`;
-      };
-      const allText = collectText(document);
-      const match = allText.match(errorPatterns);
-      if (!match) return null;
-      const idx = allText.toLowerCase().indexOf(match[0].toLowerCase());
-      return allText.substring(Math.max(0, idx - 80), Math.min(allText.length, idx + 160)).replace(/\s+/g, " ").trim();
-    }).catch(() => null);
-
-    // List visible interactive controls so we can see what page we're actually on
-    const visibleControls: string[] = await page.evaluate(() => {
-      const isVisible = (el: Element) => {
-        const rect = (el as HTMLElement).getBoundingClientRect();
-        const style = window.getComputedStyle(el as HTMLElement);
-        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-      };
-      const collect = (container: Document | ShadowRoot | Element): Element[] => {
-        const direct = Array.from((container as Document | ShadowRoot | Element).querySelectorAll("button,[role='button'],input,a[href]"));
-        const nested = Array.from((container as Document | ShadowRoot | Element).querySelectorAll("*"))
-          .flatMap(child => (child as HTMLElement).shadowRoot ? collect((child as HTMLElement).shadowRoot!) : []);
-        return [...direct, ...nested];
-      };
-      return collect(document)
-        .filter(isVisible)
-        .map(el => {
-          const tag = el.tagName.toLowerCase();
-          const type = (el as HTMLInputElement).type || "";
-          const label = ((el as HTMLElement).innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("placeholder") || el.getAttribute("name") || "").replace(/\s+/g, " ").trim().slice(0, 50);
-          return `${tag}${type ? `[type=${type}]` : ""}${label ? `: "${label}"` : ""}`;
-        })
-        .slice(0, 15);
-    }).catch(() => []);
-
-    // Capture screenshot at moment of failure and store as a diagnostic snapshot
-    let screenshotInfo = "screenshot capture failed";
-    try {
-      const buf = await page.screenshot({ type: "jpeg", quality: 60, fullPage: false });
-      screenshotInfo = `screenshot captured (${Math.round(buf.length / 1024)}KB) — visible in Live DOM / UI States tab as 'otp-failure-diagnostic'`;
-      this.domSnapshots.push({
-        url: failureUrl,
-        phase: "otp-failure-diagnostic",
-        state: "otp-failure-diagnostic",
-        a11yTree: null,
-        screenshot: `data:image/jpeg;base64,${buf.toString("base64")}`,
-      });
-    } catch (err) {
-      logger.debug(`Failure screenshot capture failed: ${(err as Error).message}`);
-    }
-
-    // Log a clear diagnostic summary
-    logger.error(`[OTP-WAIT] ============================================================`);
-    logger.error(`[OTP-WAIT] OTP detection FAILED after ${pollCount} polls (${timeout}ms).`);
-    logger.error(`[OTP-WAIT]   Start URL:    ${startUrl}`);
-    logger.error(`[OTP-WAIT]   Failure URL:  ${failureUrl}`);
-    logger.error(`[OTP-WAIT]   URL changed:  ${startUrl !== failureUrl ? "YES" : "NO — login likely never submitted or rejected immediately"}`);
-    logger.error(`[OTP-WAIT]   Password field still visible: ${passwordStillVisible ? "YES — login form did not advance" : "NO"}`);
-    logger.error(`[OTP-WAIT]   Cookie banner still visible:  ${cookieStillVisible ? "YES — banner may have blocked submission" : "NO"}`);
-    logger.error(`[OTP-WAIT]   Error message detected:       ${errorMessage || "none"}`);
-    logger.error(`[OTP-WAIT]   Visible controls on page:    ${visibleControls.length ? visibleControls.join(" | ") : "none captured"}`);
-    logger.error(`[OTP-WAIT]   ${screenshotInfo}`);
-    logger.error(`[OTP-WAIT] ============================================================`);
-
-    // Build a useful error message that tells the user what to look at
-    let diagnosticHint = "";
-    if (errorMessage) {
-      diagnosticHint = ` — Page shows error: "${errorMessage}"`;
-    } else if (passwordStillVisible) {
-      diagnosticHint = " — Password field is STILL visible after submit. The Accedi click likely did not fire, OR credentials were rejected silently. Check the diagnostic screenshot in the UI States tab.";
-    } else if (cookieStillVisible) {
-      diagnosticHint = " — Cookie banner is still visible and is likely blocking the OTP page from rendering. Check cookie_accept_selector configuration.";
-    } else if (startUrl === failureUrl) {
-      diagnosticHint = " — URL did not change after Accedi click. Form submission may have failed silently. Check the diagnostic screenshot.";
-    } else {
-      diagnosticHint = ` — URL changed to ${failureUrl} but no OTP input/source was found. Either OTP selectors are outdated for the current Sky page structure, OR this account is not gated by OTP (login completed without requiring OTP).`;
-    }
-
-    throw new Error(`OTP page did not appear after clicking Accedi.${diagnosticHint}`);
+    throw new Error("OTP page did not appear after clicking Accedi.");
   }
 
   private selectorCandidates(selectorList?: string): string[] {
@@ -582,6 +481,8 @@ export class AccessibilityScanner {
   }
 
   private authSelector(auth: any, key: string): string {
+    if (auth?.[key]) return String(auth[key]).trim();
+    if (auth?.workflow_type !== "sky") return "";
     const defaults: Record<string, string> = {
       cookie_accept_selector: "js=document.querySelector('#notice button.accbtn[aria-label=\"Accetta tutto\"]')\n//button[@title='Accetta tutto']\n//*[@id='notice']//button[@aria-label='Accetta tutto' or normalize-space()='Accetta tutto']",
       username_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-email')\n//input[@id='sky-login-email']\n#sky-login-email",
@@ -591,7 +492,7 @@ export class AccessibilityScanner {
       otp_selector: "input.otp-input_otp-input__QvpEl\ninput[aria-label^='Please enter OTP character'], input[name*='otp' i], div[role='textbox'], [contenteditable='true']",
       otp_submit_selector: "js=document.querySelector(\"button.sky-button-primary[aria-label='Conferma']\")\n//button[normalize-space()='Conferma']\n//button[@aria-label='Conferma' and contains(@class,'sky-button-primary')]\nbutton.sky-button-primary[aria-label='Conferma']",
     };
-    return String(auth?.[key] || defaults[key] || "").trim();
+    return String(defaults[key] || "").trim();
   }
 
   private locatorRoots(page: any): any[] {
@@ -619,8 +520,6 @@ export class AccessibilityScanner {
         for (const selector of this.selectorCandidates(selectorList)) {
           const typed = await this.deepFocusAndTypeInRoot(page, root, selector, value).catch(() => false);
           if (typed && await this.verifyFieldValue(page, selector, value)) return;
-          const mouseTyped = await this.deepMouseAndTypeInRoot(page, root, selector, value).catch(() => false);
-          if (mouseTyped && await this.verifyFieldValue(page, selector, value)) return;
           const filled = await this.deepFillInRoot(root, selector, value).catch(() => false);
           if (filled) return;
         }
@@ -799,12 +698,12 @@ export class AccessibilityScanner {
       const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
       if (setter) setter.call(el, "");
       else el.value = "";
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContentBackward", data: null }));
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
       if (setter) setter.call(el, payload.value);
       else el.value = payload.value;
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: payload.value }));
-      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-      el.dispatchEvent(new Event("blur", { bubbles: true, composed: true }));
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: payload.value }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new Event("blur", { bubbles: true }));
       return el.value === payload.value;
     }, { selector, value });
   }
@@ -863,66 +762,6 @@ export class AccessibilityScanner {
     if (!focused) return false;
     await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => undefined);
     await page.keyboard.type(value, { delay: 20 });
-    return true;
-  }
-
-  private async deepMouseAndTypeInRoot(page: any, root: any, selector: string, value: string): Promise<boolean> {
-    const point = await root.evaluate((selector: string) => {
-      const isVisible = (el: Element) => {
-        const rect = (el as HTMLElement).getBoundingClientRect();
-        const style = window.getComputedStyle(el as HTMLElement);
-        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-      };
-      const queryDeep = (container: Document | ShadowRoot | Element, selector: string): Element | null => {
-        const isJs = selector.startsWith("js=");
-        const isXPath = selector.startsWith("/") || selector.startsWith("xpath=");
-        if (isJs) {
-          try {
-            const el = Function(`"use strict"; return (${selector.slice(3)});`)();
-            if (el instanceof Element) return el;
-          } catch {
-            return null;
-          }
-          return null;
-        }
-        if (isXPath) {
-          const expression = selector.replace(/^xpath=/, "").replace(/^\/\//, ".//");
-          try {
-            const doc = container instanceof Document ? container : container.ownerDocument!;
-            const result = doc.evaluate(expression, container, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-            if (result.singleNodeValue instanceof Element) return result.singleNodeValue;
-          } catch {
-            return null;
-          }
-        }
-        if (!isXPath) {
-          try {
-            const direct = (container as Document | ShadowRoot | Element).querySelector(selector);
-            if (direct) return direct;
-          } catch {
-            return null;
-          }
-        }
-        const children = Array.from((container as Document | ShadowRoot | Element).querySelectorAll("*"));
-        for (const child of children) {
-          const shadow = (child as HTMLElement).shadowRoot;
-          if (!shadow) continue;
-          const found = queryDeep(shadow, selector);
-          if (found) return found;
-        }
-        return null;
-      };
-      const el = queryDeep(document, selector) as HTMLElement | null;
-      if (!el || !isVisible(el)) return null;
-      el.scrollIntoView({ block: "center", inline: "center" });
-      const rect = el.getBoundingClientRect();
-      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-    }, selector);
-    if (!point) return false;
-    await page.mouse.click(point.x, point.y, { delay: 60 });
-    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => undefined);
-    await page.keyboard.press("Backspace").catch(() => undefined);
-    await page.keyboard.type(value, { delay: 45 });
     return true;
   }
 
@@ -1260,6 +1099,7 @@ export class AccessibilityScanner {
     }
     return false;
   }
+
   private async resolveOtpValue(page: any, auth: any, timeout = 15000): Promise<string> {
     if (auth.otp_code) return String(auth.otp_code).trim();
     const otpSourceSelector = this.authSelector(auth, "otp_source_selector");
@@ -1660,7 +1500,7 @@ export class AccessibilityScanner {
       if (!passesCrawlFilters(url, seedUrl, opts)) continue;
 
       progress(`Crawl (${scannedKeys.size + 1}/${maxPages}, depth ${depth}): ${url}`);
-      const ok = await navigateSafely(page, url);
+      const ok = await this.navigateAndRecord(page, url, `crawl depth ${depth}`);
       if (!ok) {
         logger.warn(`Crawl: skipping unreachable URL: ${url}`);
         continue;
@@ -1835,7 +1675,7 @@ export class AccessibilityScanner {
         if (target.href) {
           const key = canonicalUrlKey(target.href) || target.href;
           if (scanned.has(key)) continue;
-          const ok = await navigateSafely(page, target.href);
+          const ok = await this.navigateAndRecord(page, target.href, `linked page state ${target.label}`);
           if (!ok) continue;
           scanned.add(key);
           await page.waitForTimeout(1200);
@@ -1861,7 +1701,7 @@ export class AccessibilityScanner {
         logger.debug(`Linked page state scan failed for ${target.label}:`, err);
       } finally {
         if (page.url() !== seedUrl) {
-          await navigateSafely(page, seedUrl).catch(() => undefined);
+          await this.navigateAndRecord(page, seedUrl, "return to seed page").catch(() => undefined);
           await page.waitForTimeout(800).catch(() => undefined);
         }
       }
