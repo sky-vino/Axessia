@@ -322,20 +322,104 @@ export class AccessibilityScanner {
         throw new Error(`Login password field was not found, was not filled, or did not retain the value with selector: ${passwordSelector}`);
       }
       logger.info(`[LOGIN-DIAG] Password field filled and verified.`);
-      this.onProgress(16, "SUCCESS: Password entered");
 
-      if (auth.auto_accept_cookies !== false) await this.waitAndClearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"), 8000);
-      const readyToSubmit = await this.verifyFieldValue(page, usernameSelector, auth.username || "") && await this.verifyFieldValue(page, passwordSelector, auth.password || "");
-      if (!readyToSubmit) {
-        throw new Error("Refusing to click Accedi because username/password are not both verified immediately before submit.");
-      }
-      logger.info(`[LOGIN-DIAG] About to click Accedi (submit) button.`);
-      const submittedPassword = await this.tryClickFirst(page, submitSelector);
-      logger.info(`[LOGIN-DIAG] Accedi click result: ${submittedPassword ? "clicked via selector" : "fallback to keyboard Enter"}`);
-      if (!submittedPassword) await page.keyboard.press("Enter").catch(() => undefined);
-      await this.waitForLoginTransition(page, auth, loginUrl, 5000);
-      const urlAfterSubmit = page.url();
-      logger.info(`[LOGIN-DIAG] After Accedi click + transition wait. URL: ${urlAfterSubmit} (changed: ${urlAfterSubmit !== loginUrl ? "YES" : "NO"})`);
+await page.keyboard.press("Tab").catch(() => undefined);
+await page.waitForTimeout(500);
+
+logger.info(`[LOGIN-DIAG] TAB pressed after password entry`);
+
+this.onProgress(16, "SUCCESS: Password entered");
+
+if (auth.auto_accept_cookies !== false)
+  await this.waitAndClearCookieConsent(
+    page,
+    this.authSelector(auth, "cookie_accept_selector"),
+    8000
+  );
+
+const readyToSubmit =
+  await this.verifyFieldValue(page, usernameSelector, auth.username || "") &&
+  await this.verifyFieldValue(page, passwordSelector, auth.password || "");
+
+if (!readyToSubmit) {
+  throw new Error(
+    "Refusing to click Accedi because username/password are not both verified immediately before submit."
+  );
+}
+
+// ====================================================
+// LOGIN NETWORK DIAGNOSTICS
+// ====================================================
+
+page.on("request", request => {
+  const url = request.url();
+
+  if (
+    url.includes("cronus") ||
+    url.includes("login") ||
+    url.includes("auth")
+  ) {
+    logger.info(
+      `[LOGIN-NET][REQ] ${request.method()} ${url}`
+    );
+  }
+});
+
+page.on("response", response => {
+  const url = response.url();
+
+  if (
+    url.includes("cronus") ||
+    url.includes("login") ||
+    url.includes("auth")
+  ) {
+    logger.info(
+      `[LOGIN-NET][RES] ${response.status()} ${url}`
+    );
+  }
+});
+
+logger.info(
+  `[STEP-1] BEFORE CLICK URL = ${page.url()}`
+);
+
+logger.info(
+  `[LOGIN-DIAG] About to click Accedi (submit) button.`
+);
+
+const submittedPassword = await this.tryClickFirst(
+  page,
+  submitSelector
+);
+
+logger.info(
+  `[STEP-2] AFTER CLICK URL = ${page.url()}`
+);
+
+await page.waitForTimeout(1000);
+
+logger.info(
+  `[STEP-3] AFTER 1 SEC URL = ${page.url()}`
+);
+
+logger.info(
+  `[LOGIN-DIAG] Accedi click result: ${
+    submittedPassword ? "clicked via selector" : "fallback to keyboard Enter"
+  }`
+);
+
+if (!submittedPassword)
+  await page.keyboard.press("Enter").catch(() => undefined);
+
+await this.waitForLoginTransition(page, auth, loginUrl, 5000);
+
+const urlAfterSubmit = page.url();
+
+logger.info(
+  `[LOGIN-DIAG] After Accedi click + transition wait. URL: ${urlAfterSubmit} (changed: ${
+    urlAfterSubmit !== loginUrl ? "YES" : "NO"
+  })`
+);
       if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
 
       const otpSelector = this.authSelector(auth, "otp_selector");
