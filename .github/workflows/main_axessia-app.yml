@@ -1,4 +1,7 @@
-name: Build and deploy Node app to Azure Web App - axessia-app
+# Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
+# More GitHub Actions for Azure: https://github.com/Azure/actions
+
+name: Build and deploy Node.js app to Azure Web App - axessia-app
 
 on:
   push:
@@ -6,114 +9,51 @@ on:
       - main
   workflow_dispatch:
 
-# Concurrency lock — if a new push arrives while an older run is still
-# deploying, cancel the older run. This prevents the "409 Conflict" we kept
-# hitting when commits landed back-to-back.
-concurrency:
-  group: deploy-axessia-app
-  cancel-in-progress: true
-
-permissions:
-  id-token: write
-  contents: read
-
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read #This is required for actions/checkout
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Node 20
-        uses: actions/setup-node@v4
+      - name: Set up Node.js version
+        uses: actions/setup-node@v3
         with:
-          node-version: "20"
+          node-version: '22.x'
 
-      # ── Frontend build ───────────────────────────────────────────────────
-      - name: Install frontend deps
-        working-directory: frontend
-        run: npm install --no-audit --no-fund --legacy-peer-deps
+      - name: Upload artifact for deployment job
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-app
+          path: .
 
-      - name: Build frontend (Vite)
-        working-directory: frontend
-        run: npm run build
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      id-token: write #This is required for requesting the JWT
+      contents: read #This is required for actions/checkout
 
-      # ── Backend build ────────────────────────────────────────────────────
-      - name: Install backend deps
-        working-directory: backend
-        run: npm install --no-audit --no-fund --legacy-peer-deps
-
-      - name: Build backend (tsc)
-        working-directory: backend
-        run: npm run build
-
-      # ── Bundle Playwright Chromium into the deploy zip ───────────────────
-      - name: Install Playwright Chromium for shipping
-        working-directory: backend
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/playwright-browsers
-        run: |
-          npx playwright install chromium
-          echo "Chromium installed:"
-          ls -la "$PLAYWRIGHT_BROWSERS_PATH"
-
-      # ── Stage exactly what ships ─────────────────────────────────────────
-      - name: Stage deploy directory
-        run: |
-          mkdir -p deploy/backend deploy/frontend deploy/playwright-browsers
-
-          cp -r backend/dist          deploy/backend/dist
-          cp -r backend/node_modules  deploy/backend/node_modules
-          cp -r backend/migrations    deploy/backend/migrations
-          cp    backend/package.json  deploy/backend/package.json
-
-          cp -r frontend/dist         deploy/frontend/dist
-
-          cp -r playwright-browsers/* deploy/playwright-browsers/ 2>/dev/null || true
-
-          cp    startup.sh            deploy/startup.sh
-          chmod +x deploy/startup.sh
-
-          echo ""
-          echo "Critical files check:"
-          test -f deploy/backend/dist/index.js                 && echo "  OK  backend/dist/index.js"
-          test -f deploy/backend/dist/scanner/scanner.js       && echo "  OK  backend/dist/scanner/scanner.js"
-          test -f deploy/backend/migrations/init.sqlite.sql    && echo "  OK  backend/migrations/init.sqlite.sql"
-          test -f deploy/frontend/dist/index.html              && echo "  OK  frontend/dist/index.html"
-          test -f deploy/startup.sh                            && echo "  OK  startup.sh"
-          CHROME=$(find deploy/playwright-browsers -name chrome -type f | head -1)
-          if [ -n "$CHROME" ]; then
-            echo "  OK  bundled chrome at $CHROME"
-          else
-            echo "  WARNING: no chrome binary in deploy/playwright-browsers"
-          fi
-
-          echo ""
-          echo "Verifying scanner uses headless mode:"
-          if grep -q "headless: true" deploy/backend/dist/scanner/scanner.js; then
-            echo "  OK  scanner is set to headless: true"
-          else
-            echo "  WARNING: scanner does not contain 'headless: true' — scans may fail on Azure"
-          fi
-
-      - name: Create deployment zip
-        working-directory: deploy
-        run: |
-          zip -qr ../release.zip .
-          echo "Deploy zip size: $(du -h ../release.zip | cut -f1)"
-
-      # ── Deploy to Azure ──────────────────────────────────────────────────
+    steps:
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: node-app
+      
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id:       ${{ secrets.AZUREAPPSERVICE_CLIENTID_2B7F8A68563540588D2B9FCDDE24980F }}
-          tenant-id:       ${{ secrets.AZUREAPPSERVICE_TENANTID_8ED8A0C152054104A26BD00F1B5AE9E3 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_AFB2DB03E1CD43C295D6E3C5CB7EB2AF }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_95980138A0274BE89CE9DCFC2C767970 }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_DD67FCEB9ABA429D8943671B137EA9A4 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_9C3195745BC248AC933C54E0AB90E57F }}
 
-      - name: Deploy to Azure Web App
+      - name: 'Deploy to Azure Web App'
+        id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
-          app-name:  axessia-app
-          slot-name: Production
-          package:   release.zip
+          app-name: 'axessia-app'
+          slot-name: 'Production'
+          package: .
+          
