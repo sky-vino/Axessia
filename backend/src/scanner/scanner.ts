@@ -387,10 +387,14 @@ logger.info(
   `[LOGIN-DIAG] About to click Accedi (submit) button.`
 );
 
-const submittedPassword = await this.tryClickFirst(
-  page,
-  submitSelector
+await page.keyboard.press("Tab");
+await page.waitForTimeout(500);
+
+logger.info(
+  `[LOGIN-DIAG] Pressing ENTER instead of clicking submit`
 );
+
+await page.keyboard.press("Enter");
 
 logger.info(
   `[STEP-2] AFTER CLICK URL = ${page.url()}`
