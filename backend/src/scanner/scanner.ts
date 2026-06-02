@@ -410,13 +410,8 @@ logger.info(
 );
 
 logger.info(
-  `[LOGIN-DIAG] Accedi click result: ${
-    submittedPassword ? "clicked via selector" : "fallback to keyboard Enter"
-  }`
+  `[LOGIN-DIAG] ENTER key submitted login`
 );
-
-if (!submittedPassword)
-  await page.keyboard.press("Enter").catch(() => undefined);
 
 await this.waitForLoginTransition(page, auth, loginUrl, 5000);
 
