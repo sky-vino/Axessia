@@ -322,6 +322,9 @@ export class AccessibilityScanner {
         throw new Error(`Login password field was not found, was not filled, or did not retain the value with selector: ${passwordSelector}`);
       }
       logger.info(`[LOGIN-DIAG] Password field filled and verified.`);
+      logger.error(
+  "######## ENTER SUBMIT TEST BUILD 20260602 ########"
+);
 
 await page.keyboard.press("Tab").catch(() => undefined);
 await page.waitForTimeout(500);
