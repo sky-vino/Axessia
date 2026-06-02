@@ -67,6 +67,7 @@ export interface StateConfig {
 }
 
 export interface ScanOptions {
+  workflow_type?: "generic" | "sky" | string;
   run_axe?: boolean;
   run_heuristics?: boolean;
   run_focus?: boolean;
