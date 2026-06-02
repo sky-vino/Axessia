@@ -45,10 +45,11 @@ jobs:
 
       # ────────────────────────────────────────────────────────────────
       # Backend: install deps and compile TypeScript to backend/dist
+      # Uses `npm install` (not `npm ci`) because backend has no lockfile.
       # ────────────────────────────────────────────────────────────────
       - name: Install backend dependencies
         working-directory: backend
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: Compile backend TypeScript
         working-directory: backend
@@ -61,7 +62,7 @@ jobs:
           echo ""
           echo "Checking scanner.js was compiled from latest source:"
           if grep -q "LOGIN-NET\|attachLoginNetworkDiagnostics" backend/dist/scanner/scanner.js; then
-            echo "  ✓ scanner.js contains expected diagnostic helpers"
+            echo "  OK: scanner.js contains expected diagnostic helpers"
           else
             echo "  WARNING: scanner.js does not contain expected diagnostic strings. Source may not be latest."
           fi
@@ -70,10 +71,17 @@ jobs:
 
       # ────────────────────────────────────────────────────────────────
       # Frontend: install deps and build static assets to frontend/dist
+      # Frontend HAS a package-lock.json so npm ci is fine here.
+      # Fallback to npm install if for some reason ci fails.
       # ────────────────────────────────────────────────────────────────
       - name: Install frontend dependencies
         working-directory: frontend
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
 
       - name: Build frontend
         working-directory: frontend
@@ -83,17 +91,17 @@ jobs:
         run: |
           ls -la frontend/dist/ || (echo "ERROR: frontend/dist does not exist." && exit 1)
           test -f frontend/dist/index.html || (echo "ERROR: frontend/dist/index.html missing." && exit 1)
-          echo "  ✓ frontend/dist/index.html present ($(wc -c < frontend/dist/index.html) bytes)"
+          echo "  OK: frontend/dist/index.html present ($(wc -c < frontend/dist/index.html) bytes)"
 
       # ────────────────────────────────────────────────────────────────
-      # Strip dev dependencies from backend before packaging
-      # so we don't ship typescript/eslint/etc to App Service
+      # Reinstall backend with production-only deps before packaging
+      # so we don't ship typescript/eslint/etc to App Service.
       # ────────────────────────────────────────────────────────────────
       - name: Prune backend to production dependencies only
         working-directory: backend
         run: |
           rm -rf node_modules
-          npm ci --omit=dev
+          npm install --omit=dev --no-audit --no-fund
 
       # ────────────────────────────────────────────────────────────────
       # Stamp the deployment with the commit SHA so Azure boot logs
@@ -119,7 +127,6 @@ jobs:
             backend/dist
             backend/node_modules
             backend/package.json
-            backend/package-lock.json
             frontend/dist
             startup.sh
             package.json
