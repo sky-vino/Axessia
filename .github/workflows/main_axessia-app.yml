@@ -13,35 +13,145 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read #This is required for actions/checkout
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
 
-      - name: Set up Node.js version
-        uses: actions/setup-node@v3
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
         with:
           node-version: '22.x'
 
-      - name: Upload artifact for deployment job
+      - name: Print build context (commit SHA visible at runtime)
+        run: |
+          echo "Building commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Triggered by: ${{ github.actor }}"
+          node -v
+          npm -v
+
+      # ────────────────────────────────────────────────────────────────
+      # Clean any stale build outputs so caching can never ship old code
+      # ────────────────────────────────────────────────────────────────
+      - name: Clean previous build outputs
+        run: |
+          rm -rf backend/dist
+          rm -rf frontend/dist
+          rm -rf backend/node_modules
+          rm -rf frontend/node_modules
+          rm -rf node_modules
+
+      # ────────────────────────────────────────────────────────────────
+      # Backend: install deps and compile TypeScript to backend/dist
+      # ────────────────────────────────────────────────────────────────
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Compile backend TypeScript
+        working-directory: backend
+        run: npm run build
+
+      - name: Verify backend compiled output contains latest changes
+        run: |
+          echo "Listing backend/dist/scanner:"
+          ls -la backend/dist/scanner/ || (echo "ERROR: backend/dist/scanner does not exist. Build did not produce TypeScript output." && exit 1)
+          echo ""
+          echo "Checking scanner.js was compiled from latest source:"
+          if grep -q "LOGIN-NET\|attachLoginNetworkDiagnostics" backend/dist/scanner/scanner.js; then
+            echo "  ✓ scanner.js contains expected diagnostic helpers"
+          else
+            echo "  WARNING: scanner.js does not contain expected diagnostic strings. Source may not be latest."
+          fi
+          echo ""
+          echo "Compiled scanner.js size: $(wc -c < backend/dist/scanner/scanner.js) bytes"
+
+      # ────────────────────────────────────────────────────────────────
+      # Frontend: install deps and build static assets to frontend/dist
+      # ────────────────────────────────────────────────────────────────
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Verify frontend output exists
+        run: |
+          ls -la frontend/dist/ || (echo "ERROR: frontend/dist does not exist." && exit 1)
+          test -f frontend/dist/index.html || (echo "ERROR: frontend/dist/index.html missing." && exit 1)
+          echo "  ✓ frontend/dist/index.html present ($(wc -c < frontend/dist/index.html) bytes)"
+
+      # ────────────────────────────────────────────────────────────────
+      # Strip dev dependencies from backend before packaging
+      # so we don't ship typescript/eslint/etc to App Service
+      # ────────────────────────────────────────────────────────────────
+      - name: Prune backend to production dependencies only
+        working-directory: backend
+        run: |
+          rm -rf node_modules
+          npm ci --omit=dev
+
+      # ────────────────────────────────────────────────────────────────
+      # Stamp the deployment with the commit SHA so Azure boot logs
+      # show exactly which commit is running
+      # ────────────────────────────────────────────────────────────────
+      - name: Stamp deployment with commit SHA
+        run: |
+          echo "${{ github.sha }}" > .deploy-sha
+          echo "Built at: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> .deploy-sha
+          echo "Branch: ${{ github.ref_name }}" >> .deploy-sha
+          cat .deploy-sha
+
+      # ────────────────────────────────────────────────────────────────
+      # Upload ONLY what App Service needs to run.
+      # No source .ts files, no test files, no dev dependencies.
+      # ────────────────────────────────────────────────────────────────
+      - name: Upload deployment artifact
         uses: actions/upload-artifact@v4
         with:
           name: node-app
-          path: .
+          retention-days: 7
+          path: |
+            backend/dist
+            backend/node_modules
+            backend/package.json
+            backend/package-lock.json
+            frontend/dist
+            startup.sh
+            package.json
+            .deploy-sha
 
   deploy:
     runs-on: ubuntu-latest
     needs: build
     permissions:
-      id-token: write #This is required for requesting the JWT
-      contents: read #This is required for actions/checkout
+      id-token: write
+      contents: read
 
     steps:
-      - name: Download artifact from build job
+      - name: Download deployment artifact
         uses: actions/download-artifact@v4
         with:
           name: node-app
-      
+
+      - name: Show what was downloaded
+        run: |
+          echo "Deploying commit SHA:"
+          cat .deploy-sha || echo "(deploy stamp missing)"
+          echo ""
+          echo "Top-level contents of deploy artifact:"
+          ls -la
+          echo ""
+          echo "Backend dist contents:"
+          ls -la backend/dist/ || echo "(backend/dist missing)"
+          echo ""
+          echo "Frontend dist contents:"
+          ls -la frontend/dist/ || echo "(frontend/dist missing)"
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -49,11 +159,11 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_E6DC03BC33C04A7BBA003BC60D250149 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_2E62344A18C645C8B18C606838EEDE37 }}
 
-      - name: 'Deploy to Azure Web App'
+      - name: Deploy to Azure Web App
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
           app-name: 'axessia-app'
           slot-name: 'Production'
+          clean: true
           package: .
-          
