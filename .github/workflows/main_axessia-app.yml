@@ -70,9 +70,22 @@ jobs:
           echo "Compiled scanner.js size: $(wc -c < backend/dist/scanner/scanner.js) bytes"
 
       # ────────────────────────────────────────────────────────────────
+      # Verify backend runtime assets exist (migrations, etc.) before
+      # we attempt to ship them
+      # ────────────────────────────────────────────────────────────────
+      - name: Verify backend runtime assets present
+        run: |
+          if [ -d backend/migrations ]; then
+            echo "  OK: backend/migrations present"
+            ls -la backend/migrations/
+          else
+            echo "  ERROR: backend/migrations directory missing. Backend cannot start without SQL init files."
+            exit 1
+          fi
+
+      # ────────────────────────────────────────────────────────────────
       # Frontend: install deps and build static assets to frontend/dist
-      # Frontend HAS a package-lock.json so npm ci is fine here.
-      # Fallback to npm install if for some reason ci fails.
+      # Tries npm ci first, falls back to npm install if no lockfile.
       # ────────────────────────────────────────────────────────────────
       - name: Install frontend dependencies
         working-directory: frontend
@@ -126,6 +139,7 @@ jobs:
           path: |
             backend/dist
             backend/node_modules
+            backend/migrations
             backend/package.json
             frontend/dist
             startup.sh
@@ -155,6 +169,9 @@ jobs:
           echo ""
           echo "Backend dist contents:"
           ls -la backend/dist/ || echo "(backend/dist missing)"
+          echo ""
+          echo "Backend migrations:"
+          ls -la backend/migrations/ || echo "(backend/migrations missing)"
           echo ""
           echo "Frontend dist contents:"
           ls -la frontend/dist/ || echo "(frontend/dist missing)"
