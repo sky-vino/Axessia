@@ -345,10 +345,8 @@ export class AccessibilityScanner {
 
       logger.info(`[LOGIN-DIAG] Clicking configured Accedi submit control.`);
       const clickStartedAt = Date.now();
-      const submitted = await this.tryClickFirst(page, submitSelector);
-      if (!submitted) {
-        throw new Error(`Accedi submit button was not found or not clickable with selector: ${submitSelector}`);
-      }
+      const submitMethod = await this.submitLoginWithFallbacks(page, auth, loginUrl, submitSelector, passwordSelector);
+      logger.info(`[LOGIN-DIAG] Accedi activation result: ${submitMethod}`);
 
       this.onProgress(17, "SUCCESS: Accedi clicked");
       await this.waitForLoginTransition(page, auth, loginUrl, Math.max(12000, Number(auth.post_login_wait_ms || 0)));
@@ -443,6 +441,172 @@ export class AccessibilityScanner {
     ]);
     await page.waitForTimeout(1800).catch(() => undefined);
     await page.waitForLoadState("load", { timeout: 5000 }).catch(() => undefined);
+  }
+
+  private async submitLoginWithFallbacks(
+    page: any,
+    auth: any,
+    loginUrl: string,
+    submitSelector: string,
+    passwordSelector: string
+  ): Promise<string> {
+    const attempts: Array<{ name: string; run: () => Promise<boolean> }> = [
+      {
+        name: "selector click",
+        run: () => this.tryClickFirst(page, submitSelector),
+      },
+      {
+        name: "visible text click",
+        run: () => this.clickByVisibleText(page, "Accedi"),
+      },
+      {
+        name: "DOM form requestSubmit",
+        run: () => this.requestSubmitLoginForm(page, submitSelector),
+      },
+      {
+        name: "password Enter key",
+        run: async () => {
+          const focused = await this.focusFirstAuthControl(page, passwordSelector);
+          if (!focused) return false;
+          await page.keyboard.press("Enter").catch(() => undefined);
+          return true;
+        },
+      },
+    ];
+
+    for (const attempt of attempts) {
+      const beforeUrl = page.url();
+      logger.info(`[LOGIN-DIAG] Trying Accedi activation via ${attempt.name}.`);
+      const activated = await attempt.run().catch((err: any) => {
+        logger.info(`[LOGIN-DIAG] ${attempt.name} failed before activation: ${err?.message || err}`);
+        return false;
+      });
+      if (!activated) continue;
+
+      await this.waitForLoginAttemptSignal(page, auth, loginUrl, beforeUrl, 4500);
+      const signal = await this.describeLoginAttemptSignal(page, auth, loginUrl, beforeUrl);
+      logger.info(`[LOGIN-DIAG] ${attempt.name} post-activation signal: ${signal}`);
+      if (signal !== "no visible state change") return `${attempt.name}; ${signal}`;
+    }
+
+    throw new Error(`Accedi submit control did not produce a login state change after selector, text, DOM submit, and Enter-key attempts. Selector: ${submitSelector}`);
+  }
+
+  private async waitForLoginAttemptSignal(page: any, auth: any, loginUrl: string, beforeUrl: string, timeout = 4500): Promise<void> {
+    const passwordSelector = this.authSelector(auth, "password_selector");
+    const otpSelector = this.authSelector(auth, "otp_selector");
+    await Promise.race([
+      page.waitForURL((url: URL) => url.href !== beforeUrl || url.href !== loginUrl, { timeout }).catch(() => undefined),
+      page.waitForFunction(
+        (selectors: { passwordSelector?: string; otpSelector?: string }) => {
+          const visible = (selector?: string) => {
+            if (!selector) return false;
+            try {
+              return Array.from(document.querySelectorAll(selector)).some((el: any) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+              });
+            } catch {
+              return false;
+            }
+          };
+          const text = document.body?.innerText || document.body?.textContent || "";
+          return visible(selectors.otpSelector) || !visible(selectors.passwordSelector) || /problema durante l'accesso|contatta il servizio clienti|invalid credentials|wrong password/i.test(text);
+        },
+        { passwordSelector, otpSelector },
+        { timeout }
+      ).catch(() => undefined),
+      page.waitForTimeout(timeout),
+    ]);
+    await page.waitForLoadState("domcontentloaded", { timeout: 2000 }).catch(() => undefined);
+  }
+
+  private async describeLoginAttemptSignal(page: any, auth: any, loginUrl: string, beforeUrl: string): Promise<string> {
+    const currentUrl = page.url();
+    const loginError = await this.getVisibleLoginError(page);
+    if (loginError) return `login error displayed: ${loginError}`;
+    if (currentUrl !== beforeUrl || currentUrl !== loginUrl) return `URL changed to ${currentUrl}`;
+    if (await this.hasVisibleAuthControl(page, this.authSelector(auth, "otp_selector")).catch(() => false)) return "OTP control visible";
+    if (!await this.hasVisibleAuthControl(page, this.authSelector(auth, "password_selector")).catch(() => true)) return "password control disappeared";
+    return "no visible state change";
+  }
+
+  private async focusFirstAuthControl(page: any, selectorList?: string): Promise<boolean> {
+    for (const root of this.locatorRoots(page)) {
+      for (const selector of this.selectorCandidates(selectorList)) {
+        try {
+          const locator = root.locator(selector).first();
+          if (await locator.isVisible({ timeout: 1000 }).catch(() => false)) {
+            await locator.focus({ timeout: 1000 }).catch(async () => {
+              await locator.click({ timeout: 1000 });
+            });
+            return true;
+          }
+        } catch { /* try deep focus */ }
+        try {
+          const focused = await root.evaluate((selector: string) => {
+            const find = (container: Document | ShadowRoot | Element): HTMLElement | null => {
+              const direct = (container as Document | ShadowRoot | Element).querySelector?.(selector) as HTMLElement | null;
+              if (direct) return direct;
+              for (const child of Array.from((container as Document | ShadowRoot | Element).querySelectorAll?.("*") || [])) {
+                const shadow = (child as HTMLElement).shadowRoot;
+                if (!shadow) continue;
+                const found = find(shadow);
+                if (found) return found;
+              }
+              return null;
+            };
+            const el = find(document);
+            if (!el) return false;
+            el.focus();
+            return document.activeElement === el || (el.getRootNode() as ShadowRoot).activeElement === el;
+          }, selector).catch(() => false);
+          if (focused) return true;
+        } catch { /* try next selector */ }
+      }
+    }
+    return false;
+  }
+
+  private async requestSubmitLoginForm(page: any, submitSelector?: string): Promise<boolean> {
+    for (const root of this.locatorRoots(page)) {
+      for (const selector of this.selectorCandidates(submitSelector)) {
+        const submitted = await root.evaluate((selector: string) => {
+          const queryDeep = (container: Document | ShadowRoot | Element, selector: string): HTMLElement | null => {
+            if (selector.startsWith("js=")) {
+              try {
+                const el = Function(`"use strict"; return (${selector.slice(3)});`)();
+                return el instanceof HTMLElement ? el : null;
+              } catch {
+                return null;
+              }
+            }
+            try {
+              const direct = (container as Document | ShadowRoot | Element).querySelector(selector) as HTMLElement | null;
+              if (direct) return direct;
+            } catch {
+              return null;
+            }
+            for (const child of Array.from((container as Document | ShadowRoot | Element).querySelectorAll?.("*") || [])) {
+              const shadow = (child as HTMLElement).shadowRoot;
+              if (!shadow) continue;
+              const found = queryDeep(shadow, selector);
+              if (found) return found;
+            }
+            return null;
+          };
+          const submitter = queryDeep(document, selector);
+          const form = submitter?.closest("form") as HTMLFormElement | null;
+          if (!form) return false;
+          if (typeof form.requestSubmit === "function") form.requestSubmit(submitter as HTMLButtonElement);
+          else form.submit();
+          return true;
+        }, selector).catch(() => false);
+        if (submitted) return true;
+      }
+    }
+    return false;
   }
 
   private attachLoginNetworkDiagnostics(page: any): void {
