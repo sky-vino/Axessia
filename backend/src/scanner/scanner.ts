@@ -37,6 +37,17 @@ export interface ScanResult {
   score: number;
 }
 
+interface LoginNetworkDiagnostics {
+  clientAuthorizeHit: boolean;
+  clientAuthorizeStatus?: number;
+  clientAuthorizeFailure?: string;
+  userLoginHit: boolean;
+  userLoginStatus?: number;
+  userLoginFailure?: string;
+  userLoginPreview?: string;
+  importantIncidents: string[];
+}
+
 export class AccessibilityScanner {
   private scan: any;
   private onProgress: ProgressCallback;
@@ -46,6 +57,12 @@ export class AccessibilityScanner {
   private scannedPageKeys = new Set<string>();
   private navigatedUrls: string[] = [];
   private navigatedUrlKeys = new Set<string>();
+  private loginNetworkDiagnostics: LoginNetworkDiagnostics = {
+    clientAuthorizeHit: false,
+    userLoginHit: false,
+    importantIncidents: [],
+  };
+  private importantNetworkPending = new Map<any, { method: string; url: string; startedAt: number }>();
 
   constructor(scan: any, onProgress: ProgressCallback) {
     this.scan = scan;
@@ -347,6 +364,7 @@ export class AccessibilityScanner {
       const clickStartedAt = Date.now();
       const submitMethod = await this.submitLoginWithFallbacks(page, auth, loginUrl, submitSelector, passwordSelector);
       logger.info(`[LOGIN-DIAG] Accedi activation result: ${submitMethod}`);
+      this.logLoginNetworkSummary("after Accedi activation");
 
       this.onProgress(17, "SUCCESS: Accedi clicked");
       await this.waitForLoginTransition(page, auth, loginUrl, Math.max(12000, Number(auth.post_login_wait_ms || 0)));
@@ -354,6 +372,7 @@ export class AccessibilityScanner {
       const loginError = await this.getVisibleLoginError(page);
       logger.info(`[LOGIN-PROOF] After Accedi click + ${Date.now() - clickStartedAt}ms: url=${page.url()}, visibleLoginError=${loginError || "none"}`);
       await this.captureLoginProofSnapshot(page, "after-accedi-click", loginError);
+      this.logLoginNetworkSummary("after Accedi transition wait");
       if (loginError) {
         throw new Error(`Sky rejected the login after Accedi: ${loginError}`);
       }
@@ -400,6 +419,7 @@ export class AccessibilityScanner {
       await this.ensureAuthenticatedPage(page, auth, page.url());
       return page.url();
     } catch (err) {
+      this.logLoginNetworkSummary("login failure catch");
       logger.warn("Login failed; scan will not continue with the login page:", err);
       throw err;
     }
@@ -417,6 +437,7 @@ export class AccessibilityScanner {
       logger.warn(`Authenticated URL does not contain configured success pattern '${successPattern}': ${currentUrl}`);
     }
     if (await this.hasVisibleAuthControl(page, this.authSelector(auth, "password_selector")) || await this.hasVisibleAuthControl(page, this.authSelector(auth, "otp_selector"))) {
+      this.logLoginNetworkSummary("authenticated page validation failed");
       throw new Error(`Authentication failed; login controls are still visible on ${currentUrl}.`);
     }
   }
@@ -483,43 +504,27 @@ export class AccessibilityScanner {
       });
       if (!activated) continue;
 
-      await this.waitForLoginAttemptSignal(page, auth, loginUrl, beforeUrl, 4500);
+      const signalTimeout = attempt.name === "selector click"
+        ? Math.max(15000, Number(auth.post_login_wait_ms || 0))
+        : 5000;
+      await this.waitForLoginAttemptSignal(page, auth, loginUrl, beforeUrl, signalTimeout);
       const signal = await this.describeLoginAttemptSignal(page, auth, loginUrl, beforeUrl);
       logger.info(`[LOGIN-DIAG] ${attempt.name} post-activation signal: ${signal}`);
       if (signal !== "no visible state change") return `${attempt.name}; ${signal}`;
     }
 
+    this.logLoginNetworkSummary("before Accedi fallback failure");
     throw new Error(`Accedi submit control did not produce a login state change after selector, text, DOM submit, and Enter-key attempts. Selector: ${submitSelector}`);
   }
 
   private async waitForLoginAttemptSignal(page: any, auth: any, loginUrl: string, beforeUrl: string, timeout = 4500): Promise<void> {
-    const passwordSelector = this.authSelector(auth, "password_selector");
-    const otpSelector = this.authSelector(auth, "otp_selector");
-    await Promise.race([
-      page.waitForURL((url: URL) => url.href !== beforeUrl || url.href !== loginUrl, { timeout }).catch(() => undefined),
-      page.waitForFunction(
-        (selectors: { passwordSelector?: string; otpSelector?: string }) => {
-          const visible = (selector?: string) => {
-            if (!selector) return false;
-            try {
-              return Array.from(document.querySelectorAll(selector)).some((el: any) => {
-                const rect = el.getBoundingClientRect();
-                const style = window.getComputedStyle(el);
-                return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
-              });
-            } catch {
-              return false;
-            }
-          };
-          const text = document.body?.innerText || document.body?.textContent || "";
-          return visible(selectors.otpSelector) || !visible(selectors.passwordSelector) || /problema durante l'accesso|contatta il servizio clienti|invalid credentials|wrong password/i.test(text);
-        },
-        { passwordSelector, otpSelector },
-        { timeout }
-      ).catch(() => undefined),
-      page.waitForTimeout(timeout),
-    ]);
-    await page.waitForLoadState("domcontentloaded", { timeout: 2000 }).catch(() => undefined);
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const signal = await this.describeLoginAttemptSignal(page, auth, loginUrl, beforeUrl);
+      if (signal !== "no visible state change") return;
+      await page.waitForLoadState("domcontentloaded", { timeout: 500 }).catch(() => undefined);
+      await page.waitForTimeout(500).catch(() => undefined);
+    }
   }
 
   private async describeLoginAttemptSignal(page: any, auth: any, loginUrl: string, beforeUrl: string): Promise<string> {
@@ -610,19 +615,146 @@ export class AccessibilityScanner {
   }
 
   private attachLoginNetworkDiagnostics(page: any): void {
+    this.loginNetworkDiagnostics = {
+      clientAuthorizeHit: false,
+      userLoginHit: false,
+      importantIncidents: [],
+    };
+    this.importantNetworkPending.clear();
+
     page.on("request", (request: any) => {
       const url = request.url();
       if (/cronus|login|auth|otp|skyid/i.test(url)) {
         logger.info(`[LOGIN-NET][REQ] ${request.method()} ${url}`);
       }
-    });
-
-    page.on("response", (response: any) => {
-      const url = response.url();
-      if (/cronus|login|auth|otp|skyid/i.test(url)) {
-        logger.info(`[LOGIN-NET][RES] ${response.status()} ${url}`);
+      if (this.isImportantAuthNetworkUrl(url)) {
+        this.importantNetworkPending.set(request, { method: request.method(), url, startedAt: Date.now() });
+      }
+      if (this.isCronusClientAuthorize(url)) {
+        this.loginNetworkDiagnostics.clientAuthorizeHit = true;
+        logger.info(`[LOGIN-NET][CLIENT-AUTHORIZE][REQ] method=${request.method()} url=${url}`);
+      }
+      if (this.isCronusUserLogin(url)) {
+        this.loginNetworkDiagnostics.userLoginHit = true;
+        logger.info(`[LOGIN-NET][USER-LOGIN][REQ] method=${request.method()} url=${url}`);
       }
     });
+
+    page.on("response", async (response: any) => {
+      const url = response.url();
+      const status = response.status();
+      const request = response.request?.();
+      const pending = request ? this.importantNetworkPending.get(request) : undefined;
+      if (request) this.importantNetworkPending.delete(request);
+      if (/cronus|login|auth|otp|skyid/i.test(url)) {
+        logger.info(`[LOGIN-NET][RES] ${status} ${url}`);
+      }
+      if (this.isImportantAuthNetworkUrl(url) && status >= 400) {
+        const preview = await this.safeResponsePreview(response);
+        const elapsed = pending ? `${Date.now() - pending.startedAt}ms` : "unknown";
+        const incident = `${response.request?.().method?.() || pending?.method || "?"} ${url} -> HTTP ${status} after ${elapsed}${preview ? ` body=${preview}` : ""}`;
+        this.rememberImportantNetworkIncident(incident);
+        logger.warn(`[LOGIN-NET][IMPORTANT][HTTP-ERROR] ${incident}`);
+      }
+      if (this.isCronusClientAuthorize(url)) {
+        this.loginNetworkDiagnostics.clientAuthorizeHit = true;
+        this.loginNetworkDiagnostics.clientAuthorizeStatus = status;
+        if (!response.ok()) this.loginNetworkDiagnostics.clientAuthorizeFailure = `HTTP ${status}`;
+        logger.info(`[LOGIN-NET][CLIENT-AUTHORIZE][RES] status=${status} ok=${response.ok()} url=${url}`);
+      }
+      if (this.isCronusUserLogin(url)) {
+        this.loginNetworkDiagnostics.userLoginHit = true;
+        this.loginNetworkDiagnostics.userLoginStatus = status;
+        if (!response.ok()) this.loginNetworkDiagnostics.userLoginFailure = `HTTP ${status}`;
+        const preview = !response.ok() ? await this.safeResponsePreview(response) : "";
+        if (preview) this.loginNetworkDiagnostics.userLoginPreview = preview;
+        logger.info(`[LOGIN-NET][USER-LOGIN][RES] status=${status} ok=${response.ok()}${preview ? ` body=${preview}` : ""} url=${url}`);
+      }
+    });
+
+    page.on("requestfailed", (request: any) => {
+      const url = request.url();
+      const failure = request.failure?.()?.errorText || "unknown failure";
+      const pending = this.importantNetworkPending.get(request);
+      this.importantNetworkPending.delete(request);
+      if (/cronus|login|auth|otp|skyid/i.test(url)) {
+        logger.warn(`[LOGIN-NET][REQ-FAILED] ${request.method()} ${url} failure=${failure}`);
+      }
+      if (this.isImportantAuthNetworkUrl(url)) {
+        const elapsed = pending ? `${Date.now() - pending.startedAt}ms` : "unknown";
+        const incident = `${request.method()} ${url} failed after ${elapsed}: ${failure}`;
+        this.rememberImportantNetworkIncident(incident);
+        logger.warn(`[LOGIN-NET][IMPORTANT][REQ-FAILED] ${incident}`);
+      }
+      if (this.isCronusClientAuthorize(url)) {
+        this.loginNetworkDiagnostics.clientAuthorizeHit = true;
+        this.loginNetworkDiagnostics.clientAuthorizeFailure = failure;
+        logger.warn(`[LOGIN-NET][CLIENT-AUTHORIZE][REQ-FAILED] failure=${failure} url=${url}`);
+      }
+      if (this.isCronusUserLogin(url)) {
+        this.loginNetworkDiagnostics.userLoginHit = true;
+        this.loginNetworkDiagnostics.userLoginFailure = failure;
+        logger.warn(`[LOGIN-NET][USER-LOGIN][REQ-FAILED] failure=${failure} url=${url}`);
+      }
+    });
+  }
+
+  private isImportantAuthNetworkUrl(url: string): boolean {
+    return /test\.cerebro-platform\.sky\.it|test-www\.sky\.it|test\.abbonamento\.sky\.it|\/cronus\/|\/otp\b|\/login\b|\/auth\b|\/authorize\b|\/token\b|skyid/i.test(url);
+  }
+
+  private isCronusClientAuthorize(url: string): boolean {
+    return /\/cronus\/v2\/client\/authorize\b/i.test(url);
+  }
+
+  private isCronusUserLogin(url: string): boolean {
+    return /\/cronus\/v2\/user\/login\b/i.test(url);
+  }
+
+  private async safeResponsePreview(response: any): Promise<string> {
+    try {
+      const contentType = String(response.headers?.()["content-type"] || "");
+      if (!/json|text|html|plain/i.test(contentType)) return `content-type=${contentType || "unknown"}`;
+      const text = await response.text();
+      return this.sanitizeNetworkBody(text).slice(0, 800);
+    } catch (err) {
+      return `body unavailable: ${(err as Error)?.message || err}`;
+    }
+  }
+
+  private sanitizeNetworkBody(value: string): string {
+    return String(value || "")
+      .replace(/("?(?:access_token|refresh_token|id_token|token|password|authorization)"?\s*[:=]\s*)"[^"]+"/gi, "$1\"[redacted]\"")
+      .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[redacted]")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  private rememberImportantNetworkIncident(incident: string): void {
+    const list = this.loginNetworkDiagnostics.importantIncidents;
+    if (list.includes(incident)) return;
+    list.push(incident);
+    if (list.length > 12) list.shift();
+  }
+
+  private logLoginNetworkSummary(context: string): void {
+    const diag = this.loginNetworkDiagnostics;
+    const pending = [...this.importantNetworkPending.values()]
+      .filter(item => this.isImportantAuthNetworkUrl(item.url))
+      .slice(-8)
+      .map(item => `${item.method} ${item.url} pending ${Date.now() - item.startedAt}ms`);
+    logger.info(
+      `[LOGIN-NET][SUMMARY] ${context}: ` +
+      `clientAuthorizeHit=${diag.clientAuthorizeHit ? "YES" : "NO"}` +
+      `${typeof diag.clientAuthorizeStatus === "number" ? ` clientAuthorizeStatus=${diag.clientAuthorizeStatus}` : ""}` +
+      `${diag.clientAuthorizeFailure ? ` clientAuthorizeFailure=${diag.clientAuthorizeFailure}` : ""}; ` +
+      `userLoginHit=${diag.userLoginHit ? "YES" : "NO"}` +
+      `${typeof diag.userLoginStatus === "number" ? ` userLoginStatus=${diag.userLoginStatus}` : ""}` +
+      `${diag.userLoginFailure ? ` userLoginFailure=${diag.userLoginFailure}` : ""}` +
+      `${diag.userLoginPreview ? ` userLoginBody=${diag.userLoginPreview}` : ""}` +
+      `${diag.importantIncidents.length ? `; importantFailures=${diag.importantIncidents.join(" || ")}` : ""}` +
+      `${pending.length ? `; pendingImportantRequests=${pending.join(" || ")}` : ""}`
+    );
   }
 
   private async captureLoginProofSnapshot(page: any, phase: string, visibleError?: string | null): Promise<void> {
