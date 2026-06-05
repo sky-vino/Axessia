@@ -812,7 +812,7 @@ export class AccessibilityScanner {
 
   private async waitForPostLoginReady(page: any, auth: any, loginUrl: string): Promise<void> {
     const requestedWait = Number(auth.post_login_wait_ms || 0);
-    const timeout = Math.max(15000, Math.min(requestedWait || 15000, 45000));
+    const timeout = Math.max(60000, Math.min(requestedWait || 60000, 60000));
     const successPattern = String(auth.success_url_pattern || "").trim();
 
     if (successPattern) {
