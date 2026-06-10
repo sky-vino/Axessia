@@ -430,15 +430,40 @@ export class AccessibilityScanner {
     const loginUrl = String(auth.login_url || "");
     const successPattern = String(auth.success_url_pattern || "").trim();
 
-    if (/\/login|signin|sign-in|auth/i.test(currentUrl) && !successPattern) {
-      logger.warn(`Authenticated URL still looks like an auth URL; validating by visible controls instead: ${currentUrl}`);
-    }
-    if (successPattern && !currentUrl.includes(successPattern)) {
-      logger.warn(`Authenticated URL does not contain configured success pattern '${successPattern}': ${currentUrl}`);
-    }
-    if (await this.hasVisibleAuthControl(page, this.authSelector(auth, "password_selector")) || await this.hasVisibleAuthControl(page, this.authSelector(auth, "otp_selector"))) {
+    logger.info(`[AUTH-VERIFY] Current URL: ${currentUrl}`);
+
+    const cookies = await page.context().cookies().catch(() => []);
+    logger.info(
+      `[AUTH-VERIFY] Cookies: ${cookies.map((c: any) => `${c.name}@${c.domain}`).join(", ")}`
+    );
+
+    if (await this.hasVisibleAuthControl(page, this.authSelector(auth, "password_selector")) ||
+        await this.hasVisibleAuthControl(page, this.authSelector(auth, "otp_selector"))) {
       this.logLoginNetworkSummary("authenticated page validation failed");
       throw new Error(`Authentication failed; login controls are still visible on ${currentUrl}.`);
+    }
+
+    if (successPattern) {
+      if (!currentUrl.includes(successPattern)) {
+        throw new Error(
+          `Authentication completed but success URL pattern '${successPattern}' was not reached. Current URL: ${currentUrl}`
+        );
+      }
+      return;
+    }
+
+    if (/security|verify-enrollment|mfa/i.test(currentUrl)) {
+      throw new Error(
+        `Authentication appears incomplete. Browser is still on MFA/Security flow: ${currentUrl}`
+      );
+    }
+
+    if (/\/login|signin|sign-in|auth/i.test(currentUrl) &&
+        !this.sameUrlWithoutHash(currentUrl, expectedUrl) &&
+        !this.sameUrlWithoutHash(currentUrl, loginUrl)) {
+      throw new Error(
+        `Authentication appears incomplete. Current URL still resembles an authentication page: ${currentUrl}`
+      );
     }
   }
 
@@ -812,7 +837,7 @@ export class AccessibilityScanner {
 
   private async waitForPostLoginReady(page: any, auth: any, loginUrl: string): Promise<void> {
     const requestedWait = Number(auth.post_login_wait_ms || 0);
-    const timeout = Math.max(60000, Math.min(requestedWait || 60000, 60000));
+    const timeout = Math.max(15000, Math.min(requestedWait || 15000, 45000));
     const successPattern = String(auth.success_url_pattern || "").trim();
 
     if (successPattern) {
@@ -1028,7 +1053,7 @@ export class AccessibilityScanner {
     const defaults: Record<string, string> = {
       cookie_accept_selector: "js=document.querySelector('#notice button.accbtn[aria-label=\"Accetta tutto\"]')\n//button[@title='Accetta tutto']\n//*[@id='notice']//button[@aria-label='Accetta tutto' or normalize-space()='Accetta tutto']",
       username_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-email')\n//input[@id='sky-login-email']\n#sky-login-email",
-      password_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('div.sky-login-label-password login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-password')\n//input[@id='sky-login-password']\n#sky-login-password",
+      password_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-password')\n//input[@id='sky-login-password']\n#sky-login-password",
       submit_selector: "js=document.querySelector('sky-login-component#sky-login button.sky-login-submit[type=\"submit\"]')\n//button[@class='sky-login-submit']\n//button[contains(@class,'sky-login-submit')]\nbutton.sky-login-submit[type='submit']",
       otp_source_selector: "div.otp-verify-sms-content > p",
       otp_selector: "input.otp-input_otp-input__QvpEl\ninput[aria-label^='Please enter OTP character'], input[name*='otp' i], div[role='textbox'], [contenteditable='true']",
