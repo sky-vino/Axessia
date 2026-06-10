@@ -271,7 +271,24 @@ export class AccessibilityScanner {
     return context;
   }
 
-  private trackPageNavigations(page: any, context: string): void {
+  
+  private attachScanDiagnostics(page: Page): void {
+    page.on("framenavigated", (frame) => {
+      try {
+        if (frame === page.mainFrame()) {
+          const url = frame.url();
+          logger.info(`[SCAN-DIAG][NAV] ${url}`);
+          if (/gestisci|profile|account|profilo/i.test(url)) {
+            logger.warn(`[SCAN-DIAG][ACCOUNT-PAGE] Browser navigated to account/profile page: ${url}`);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    });
+  }
+
+private trackPageNavigations(page: any, context: string): void {
     page.on("request", (request: any) => {
       try {
         if (request.isNavigationRequest?.() && request.resourceType?.() === "document" && request.frame?.() === page.mainFrame()) {
@@ -292,7 +309,10 @@ export class AccessibilityScanner {
     const url = String(rawUrl || "").trim();
     if (!url || url === "about:blank") return;
     const key = url;
-    if (this.navigatedUrlKeys.has(key)) return;
+    if (this.navigatedUrlKeys.has(key)) {
+      logger.info(`Scan revisited URL (${context}): ${url}`);
+      return;
+    }
     this.navigatedUrlKeys.add(key);
     this.navigatedUrls.push(url);
     logger.info(`Scan navigated through URL (${context}): ${url}`);
@@ -417,6 +437,8 @@ export class AccessibilityScanner {
         throw new Error("Login did not complete; password or OTP controls are still visible.");
       }
       await this.ensureAuthenticatedPage(page, auth, page.url());
+    logger.info(`[SCAN-DIAG][POST-AUTH] Authenticated URL: ${page.url()}`);
+    this.attachScanDiagnostics(page);
       return page.url();
     } catch (err) {
       this.logLoginNetworkSummary("login failure catch");
