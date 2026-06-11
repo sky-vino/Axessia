@@ -271,6 +271,20 @@ export class AccessibilityScanner {
     return context;
   }
 
+  private attachScanDiagnostics(page: any): void {
+    page.on("framenavigated", (frame: any) => {
+      try {
+        if (frame === page.mainFrame()) {
+          const url = frame.url();
+          logger.info(`[SCAN-DIAG][NAV] ${url}`);
+          if (/gestisci|profile|account|profilo/i.test(url)) {
+            logger.warn(`[SCAN-DIAG][ACCOUNT-PAGE] Browser navigated to account/profile page: ${url}`);
+          }
+        }
+      } catch {}
+    });
+  }
+
   private trackPageNavigations(page: any, context: string): void {
     page.on("request", (request: any) => {
       try {
@@ -292,7 +306,7 @@ export class AccessibilityScanner {
     const url = String(rawUrl || "").trim();
     if (!url || url === "about:blank") return;
     const key = url;
-    if (this.navigatedUrlKeys.has(key)) return;
+    if (this.navigatedUrlKeys.has(key)) { logger.info(`Scan revisited URL (${context}): ${url}`); return; }
     this.navigatedUrlKeys.add(key);
     this.navigatedUrls.push(url);
     logger.info(`Scan navigated through URL (${context}): ${url}`);
