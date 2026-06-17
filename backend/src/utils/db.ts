@@ -9,15 +9,23 @@ type QueryResult<T = any> = { rows: T[] };
 
 const jsonColumns = new Set([
   "urls",
+  "navigated_urls",
   "scan_options",
   "auth_config",
   "selectors",
+  "affected_elements",
   "depths",
   "wcag_criteria",
   "act_rules",
   "tags",
   "steps",
-  "a11y_tree"
+  "a11y_tree",
+  "current_wcag",
+  "suggested_wcag",
+  "default_wcag",
+  "approved_wcag",
+  "previous_wcag",
+  "decided_wcag"
 ]);
 
 const booleanColumns = new Set(["is_active", "is_resolved", "false_positive"]);
@@ -94,7 +102,9 @@ class SqlitePool {
     const schema = await fs.readFile(path.resolve(process.cwd(), "migrations", "init.sqlite.sql"), "utf8");
     await this.connection.exec(schema);
     await this.ensureIssueEvidenceColumns();
+    await this.ensureScanNavigationColumns();
     await this.ensureAuditEventsTable();
+    await this.ensureWcagGovernanceTables();
     await this.ensureDefaultAdmin();
     await this.ensureDefaultUsers();
 
@@ -104,11 +114,22 @@ class SqlitePool {
   private async ensureIssueEvidenceColumns(): Promise<void> {
     const columns = await this.connection!.all("PRAGMA table_info(issues)");
     const existing = new Set(columns.map((column: any) => column.name));
+    if (!existing.has("affected_elements")) {
+      await this.connection!.exec("ALTER TABLE issues ADD COLUMN affected_elements TEXT;");
+    }
     if (!existing.has("evidence_screenshot")) {
       await this.connection!.exec("ALTER TABLE issues ADD COLUMN evidence_screenshot TEXT;");
     }
     if (!existing.has("evidence_explanation")) {
       await this.connection!.exec("ALTER TABLE issues ADD COLUMN evidence_explanation TEXT;");
+    }
+  }
+
+  private async ensureScanNavigationColumns(): Promise<void> {
+    const columns = await this.connection!.all("PRAGMA table_info(scans)");
+    const existing = new Set(columns.map((column: any) => column.name));
+    if (!existing.has("navigated_urls")) {
+      await this.connection!.exec("ALTER TABLE scans ADD COLUMN navigated_urls TEXT;");
     }
   }
 
@@ -126,6 +147,97 @@ class SqlitePool {
       );
       CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events(actor_id);
       CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at DESC);
+    `);
+  }
+
+  private async ensureWcagGovernanceTables(): Promise<void> {
+    await this.connection!.exec(`
+      CREATE TABLE IF NOT EXISTS wcag_mappings (
+        id             TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(6)))),
+        rule_id        TEXT NOT NULL,
+        wcag_criteria  TEXT NOT NULL,
+        mapping_status TEXT NOT NULL DEFAULT 'review_required' CHECK (mapping_status IN ('active', 'review_required', 'rejected')),
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        reviewed_by    TEXT REFERENCES users(id) ON DELETE SET NULL,
+        reviewed_at    TEXT,
+        review_notes   TEXT,
+        UNIQUE(rule_id, wcag_criteria)
+      );
+
+      CREATE TABLE IF NOT EXISTS wcag_governance_logs (
+        id             TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(6)))),
+        mapping_id     TEXT NOT NULL REFERENCES wcag_mappings(id) ON DELETE CASCADE,
+        action         TEXT NOT NULL CHECK (action IN ('created', 'approved', 'rejected', 'auto_cached')),
+        performed_by   TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+        notes          TEXT,
+        timestamp      TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_wcag_mappings_rule_id ON wcag_mappings(rule_id);
+      CREATE INDEX IF NOT EXISTS idx_wcag_mappings_status ON wcag_mappings(mapping_status);
+      CREATE INDEX IF NOT EXISTS idx_wcag_mappings_created ON wcag_mappings(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_wcag_governance_logs_mapping ON wcag_governance_logs(mapping_id);
+      CREATE INDEX IF NOT EXISTS idx_wcag_governance_logs_timestamp ON wcag_governance_logs(timestamp DESC);
+      CREATE INDEX IF NOT EXISTS idx_wcag_governance_logs_action ON wcag_governance_logs(action);
+
+      CREATE TABLE IF NOT EXISTS wcag_metadata (
+        criterion   TEXT PRIMARY KEY,
+        title       TEXT NOT NULL,
+        level       TEXT,
+        principle   TEXT,
+        url         TEXT,
+        source      TEXT,
+        fetched_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS wcag_mapping_reviews (
+        id             TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(6)))),
+        rule_id        TEXT NOT NULL,
+        current_wcag   TEXT NOT NULL,
+        suggested_wcag TEXT,
+        reason         TEXT NOT NULL,
+        status         TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','dismissed','resolved')),
+        first_seen_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        last_seen_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        resolved_at    TEXT,
+        UNIQUE(rule_id, current_wcag, reason)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_wcag_mapping_reviews_status ON wcag_mapping_reviews(status);
+      CREATE INDEX IF NOT EXISTS idx_wcag_mapping_reviews_last_seen ON wcag_mapping_reviews(last_seen_at DESC);
+
+      CREATE TABLE IF NOT EXISTS wcag_rule_registry (
+        rule_id             TEXT PRIMARY KEY,
+        rule_name           TEXT NOT NULL,
+        category            TEXT,
+        default_wcag        TEXT NOT NULL DEFAULT '[]',
+        approved_wcag       TEXT NOT NULL DEFAULT '[]',
+        mapping_status      TEXT NOT NULL DEFAULT 'review_required' CHECK (mapping_status IN ('approved','review_required','rejected','obsolete','advisory')),
+        review_status       TEXT NOT NULL DEFAULT 'pending' CHECK (review_status IN ('pending','approved','rejected','resolved')),
+        source_module       TEXT,
+        rationale           TEXT,
+        last_reviewed_by    TEXT REFERENCES users(id) ON DELETE SET NULL,
+        last_reviewed_at    TEXT,
+        created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS wcag_mapping_decisions (
+        id               TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(6)))),
+        rule_id          TEXT NOT NULL REFERENCES wcag_rule_registry(rule_id) ON DELETE CASCADE,
+        previous_wcag    TEXT,
+        decided_wcag     TEXT NOT NULL DEFAULT '[]',
+        decision         TEXT NOT NULL CHECK (decision IN ('accepted','dismissed','resolved','registered','auto_review_required')),
+        reason           TEXT,
+        decided_by       TEXT REFERENCES users(id) ON DELETE SET NULL,
+        decided_at       TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_wcag_rule_registry_status ON wcag_rule_registry(mapping_status, review_status);
+      CREATE INDEX IF NOT EXISTS idx_wcag_rule_registry_updated ON wcag_rule_registry(updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_wcag_mapping_decisions_rule ON wcag_mapping_decisions(rule_id);
+      CREATE INDEX IF NOT EXISTS idx_wcag_mapping_decisions_date ON wcag_mapping_decisions(decided_at DESC);
     `);
   }
 

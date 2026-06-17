@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "build": "tsc",
+    "validate:wcag-mappings": "ts-node scripts/validateWcagMappings.ts",
     "start": "node dist/index.js",
     "migrate": "node dist/utils/db.js"
   },

@@ -93,6 +93,13 @@ export const userApi = {
   patch: (id: string, data: any) => api.patch(`/users/${id}`, data)
 };
 
+export const wcagGovernanceApi = {
+  status: () => api.get("/wcag-governance/status"),
+  reviews: (status = "pending") => api.get("/wcag-governance/reviews", { params: { status } }),
+  refresh: () => api.post("/wcag-governance/refresh"),
+  updateReview: (id: string, status: string) => api.patch(`/wcag-governance/reviews/${id}`, { status })
+};
+
 export const reportApi = {
   getReport: (scanId: string, sections?: string[]) => api.get(`/scans/${scanId}/report`, {
     responseType: "text",
@@ -107,6 +114,5 @@ export const reportApi = {
   },
   getScreenshots: (scanId: string) => api.get(`/scans/${scanId}/screenshots`),
 };
-
 
 

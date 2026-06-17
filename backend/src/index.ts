@@ -17,8 +17,10 @@ import { scanRouter } from "./routes/scans";
 import { issueRouter } from "./routes/issues";
 import { projectRouter } from "./routes/projects";
 import { userRouter } from "./routes/users";
+import { wcagGovernanceRouter } from "./routes/wcagGovernance";
 import { wsManager } from "./utils/wsManager";
 import { scanQueue } from "./services/scanQueue";
+import { ensureWcagGovernanceReady } from "./services/wcagGovernanceService";
 
 const app = express();
 const httpServer = createServer(app);
@@ -59,6 +61,7 @@ app.use("/api/scans", scanRouter);
 app.use("/api/issues", issueRouter);
 app.use("/api/projects", projectRouter);
 app.use("/api/users", userRouter);
+app.use("/api/wcag-governance", wcagGovernanceRouter);
 
 app.get("/api/health", (_req, res) => {
   res.json({
@@ -117,6 +120,7 @@ app.use(errorHandler);
 
 // ─── Start ──────────────────────────────────────────────────────────────────
 const PORT = Number(process.env.PORT) || 4000;
+const GOVERNANCE_CHECK_MS = 60 * 60 * 1000;
 
 async function start() {
   try {
@@ -125,6 +129,10 @@ async function start() {
 
     scanQueue.init();
     logger.info("Scan queue initialized");
+    ensureWcagGovernanceReady().catch((error) => logger.warn("WCAG governance startup check failed:", error));
+    setInterval(() => {
+      ensureWcagGovernanceReady().catch((error) => logger.warn("WCAG governance scheduled check failed:", error));
+    }, GOVERNANCE_CHECK_MS).unref?.();
 
     httpServer.listen(PORT, () => {
       logger.info(`Axessia backend running on port ${PORT}`);

@@ -37,6 +37,18 @@ const STATUS_COLORS: Record<string, string> = {
   cancelled: "text-slate-500 bg-slate-500/10",
 };
 
+const REPORT_SECTION_OPTIONS = [
+  { id: "executive", label: "Executive report" },
+  { id: "summary", label: "Summary" },
+  { id: "testcases", label: "Test cases" },
+  { id: "states", label: "UI states" },
+  { id: "issues", label: "Issues" },
+];
+
+function shortId(id?: string) {
+  return String(id || "").slice(0, 8).toUpperCase();
+}
+
 export default function ScanDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -47,6 +59,8 @@ export default function ScanDetailPage() {
   const [focusedStateIssueId, setFocusedStateIssueId] = useState<string | null>(null);
   const [focusedStateName, setFocusedStateName] = useState<string | null>(null);
   const [downloading, setDownloading] = useState<string | null>(null);
+  const [reportMenuOpen, setReportMenuOpen] = useState(false);
+  const [reportSections, setReportSections] = useState<string[]>(REPORT_SECTION_OPTIONS.map(option => option.id));
   const [rerunning, setRerunning] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [scanLogs, setScanLogs] = useState<string[]>([]);
@@ -91,27 +105,56 @@ export default function ScanDetailPage() {
     return () => ws.close();
   }, [id, qc]);
 
-  const handleDownloadReport = () => {
-    if (!id) return;
-    const url = reportApi.getReportUrl(id);
-    const token = (() => {
-      try {
-        const s = JSON.parse(localStorage.getItem("accessibility-auth") || "{}");
-        return s?.state?.accessToken || "";
-      } catch { return ""; }
-    })();
-    const win = window.open("about:blank", "_blank");
-    if (win) {
-      setDownloading("report");
-      fetch(url, { headers: { Authorization: `Bearer ${token}` } })
-        .then(r => r.text())
-        .then(html => {
-          win.document.write(html);
-          win.document.close();
-          setDownloading(null);
-        })
-        .catch(() => { win.close(); setDownloading(null); });
+  const handleDownloadReport = async () => {
+    if (!id || downloading === "report") return;
+    const sections = reportSections.length ? reportSections : REPORT_SECTION_OPTIONS.map(option => option.id);
+
+    const win = window.open("", "_blank");
+    if (!win) return;
+    win.document.write(`
+      <html>
+        <head><title>Preparing Accessibility Report</title></head>
+        <body style="font-family: Arial, sans-serif; padding: 24px; color: #1f2937;">
+          <h2>Preparing report...</h2>
+          <p>Please wait while the accessibility report is generated.</p>
+        </body>
+      </html>
+    `);
+    win.document.close();
+
+    setDownloading("report");
+    try {
+      const { data: html } = await reportApi.getReport(id, sections);
+      const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+      const blobUrl = URL.createObjectURL(blob);
+      win.location.replace(blobUrl);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+    } catch {
+      win.document.open();
+      win.document.write(`
+        <html>
+          <head><title>Report unavailable</title></head>
+          <body style="font-family: Arial, sans-serif; padding: 24px; color: #1f2937;">
+            <h2>Report could not be opened</h2>
+            <p>Your session may have expired. Please sign in again and try the PDF Report button once more.</p>
+          </body>
+        </html>
+      `);
+      win.document.close();
+    } finally {
+      setDownloading(null);
+      setReportMenuOpen(false);
     }
+  };
+
+  const toggleReportSection = (sectionId: string) => {
+    setReportSections(current => {
+      if (current.includes(sectionId)) {
+        const next = current.filter(id => id !== sectionId);
+        return next.length ? next : current;
+      }
+      return [...current, sectionId];
+    });
   };
 
   const handleRefresh = async () => {
@@ -181,6 +224,7 @@ export default function ScanDetailPage() {
                 </span>
               </div>
               <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-slate-600 mt-1">
+                <span>ID: <span className="font-mono text-slate-400">{shortId(scan.id)}</span></span>
                 <span>{(scan.urls || []).join(", ").slice(0, 100)}</span>
                 {isRunning && <span className="text-accent font-medium">Progress: {scan.progress}%</span>}
               </div>
@@ -201,18 +245,69 @@ export default function ScanDetailPage() {
               </button>
             )}
             {isComplete && (
-              <button
-                onClick={handleDownloadReport}
-                disabled={downloading === "report"}
-                className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg border transition-all hover:bg-white/[0.04]"
-                style={{ borderColor: "rgba(15,118,110,0.3)", color: "#0f766e" }}
-                title="Open report in browser — use Ctrl+P to save as PDF"
-              >
-                {downloading === "report"
-                  ? <Loader2 size={13} className="animate-spin" />
-                  : <FileText size={13} />}
-                PDF Report
-              </button>
+              <div className="relative">
+                <button
+                  onClick={() => setReportMenuOpen(open => !open)}
+                  disabled={downloading === "report"}
+                  className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg border transition-all hover:bg-white/[0.04]"
+                  style={{ borderColor: "rgba(15,118,110,0.3)", color: "#0f766e" }}
+                  title="Choose report sections before opening the printable report"
+                >
+                  {downloading === "report"
+                    ? <Loader2 size={13} className="animate-spin" />
+                    : <FileText size={13} />}
+                  PDF Report
+                </button>
+                {reportMenuOpen && (
+                  <div
+                    className="absolute right-0 top-full mt-2 w-72 rounded-xl border p-3 z-30 shadow-2xl"
+                    style={{ background: "var(--surface-1)", borderColor: "var(--border-strong)" }}
+                  >
+                    <div className="text-xs font-semibold mb-2" style={{ color: "var(--text-strong)" }}>Report contents</div>
+                    <div className="space-y-2 mb-3">
+                      {REPORT_SECTION_OPTIONS.map(option => (
+                        <label key={option.id} className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: "var(--text)" }}>
+                          <input
+                            type="checkbox"
+                            checked={reportSections.includes(option.id)}
+                            onChange={() => toggleReportSection(option.id)}
+                            className="h-3.5 w-3.5"
+                          />
+                          <span>{option.label}</span>
+                        </label>
+                      ))}
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 mb-3">
+                      <button
+                        type="button"
+                        onClick={() => setReportSections(REPORT_SECTION_OPTIONS.map(option => option.id))}
+                        className="text-xs px-2 py-1.5 rounded-lg border"
+                        style={{ borderColor: "var(--border-strong)", color: "var(--text)" }}
+                      >
+                        All
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setReportSections(["executive"])}
+                        className="text-xs px-2 py-1.5 rounded-lg border"
+                        style={{ borderColor: "var(--border-strong)", color: "var(--text)" }}
+                      >
+                        Executive
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleDownloadReport}
+                      disabled={downloading === "report"}
+                      className="w-full flex items-center justify-center gap-1.5 text-xs px-3 py-2 rounded-lg border transition-all disabled:opacity-60"
+                      style={{ borderColor: "rgba(15,118,110,0.35)", color: "#0f766e", background: "rgba(15,118,110,0.08)" }}
+                    >
+                      {downloading === "report" ? <Loader2 size={13} className="animate-spin" /> : <FileText size={13} />}
+                      Open printable report
+                    </button>
+                  </div>
+                )}
+              </div>
             )}
             <button onClick={handleRefresh}
               disabled={refreshing}

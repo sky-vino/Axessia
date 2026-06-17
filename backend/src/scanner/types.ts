@@ -14,6 +14,7 @@ export interface ScanIssue {
   url: string;
   selector?: string;
   selectors?: string[];
+  affectedElements?: string[];
   depths?: number[];
   wcag?: string[];
   act?: string[];
