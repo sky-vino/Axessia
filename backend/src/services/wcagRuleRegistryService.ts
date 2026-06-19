@@ -56,6 +56,8 @@ const APPROVED_RULE_MAPPINGS: Array<{
   { ruleId: "zoom:viewport-locked", ruleName: "Viewport prevents user zoom", category: "zoom", wcag: ["1.4.4"], sourceModule: "zoomPointer", rationale: "Blocking zoom prevents resizing text." },
   { ruleId: "zoom:fixed-font-size", ruleName: "Fixed font size may block text resizing", category: "zoom", wcag: ["1.4.4"], sourceModule: "zoomPointer", rationale: "Text resizing depends on scalable text units." },
   { ruleId: "zoom:reflow-failure", ruleName: "Content does not reflow at narrow viewport", category: "zoom", wcag: ["1.4.10"], sourceModule: "zoomPointer", rationale: "Horizontal two-dimensional scrolling at 320 CSS px is a reflow failure." },
+  { ruleId: "zoom:intermediate-breakpoint-failure", ruleName: "Content fails at an intermediate zoom breakpoint", category: "zoom", wcag: ["1.4.4", "1.4.10"], sourceModule: "zoomPointer", rationale: "Content must remain available throughout 200%-400% zoom, not only at the final narrow breakpoint." },
+  { ruleId: "zoom:viewport-restoration-failure", ruleName: "Page state does not recover after zoom", category: "zoom", wcag: ["1.4.10", "1.4.13", "3.2.2"], sourceModule: "zoomPointer", rationale: "Restoring the viewport must not leave expanded content, scroll locks, transforms, or overflow that obscures or unexpectedly changes the page." },
   { ruleId: "zoom:text-clipped", ruleName: "Text is clipped at zoom", category: "zoom", wcag: ["1.4.4", "1.4.10"], sourceModule: "zoomPointer", rationale: "Clipped text can fail resizing text and reflow requirements." },
   { ruleId: "zoom:fixed-sticky-obstruction", ruleName: "Sticky content obstructs content at zoom", category: "zoom", wcag: ["1.4.10", "2.4.11"], sourceModule: "zoomPointer", rationale: "Sticky overlays can break reflow and obscure focused content." },
   { ruleId: "zoom:dialog-does-not-fit", ruleName: "Dialog does not fit at zoom", category: "zoom", wcag: ["1.4.10", "2.1.2"], sourceModule: "zoomPointer", rationale: "Dialogs must remain usable at narrow/zoomed layouts without trapping keyboard users." },
@@ -240,4 +242,3 @@ export async function resolveRuleMappingReview(ruleId: string, criteria: string[
 export function activeWcag22CriteriaCount(): number {
   return ACTIVE_WCAG_22.size;
 }
-
