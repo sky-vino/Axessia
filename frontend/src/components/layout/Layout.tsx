@@ -3,7 +3,7 @@ import { useAuth } from "../../store/auth";
 import { useTheme } from "../../store/theme";
 import {
   LayoutDashboard, Plus, LogOut, ChevronDown, Moon, Sun, History,
-  ArrowUp, ArrowDown, PanelLeftClose, PanelLeftOpen, Users
+  ArrowUp, ArrowDown, PanelLeftClose, PanelLeftOpen, Users, ShieldCheck
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
@@ -58,7 +58,10 @@ export default function Layout() {
     { to: "/", icon: LayoutDashboard, label: "Dashboard", end: true },
     { to: "/history", icon: History, label: "History" },
     { to: "/scans/new", icon: Plus, label: "New Scan" },
-    ...(user?.role === "admin" ? [{ to: "/users", icon: Users, label: "Users" }] : [])
+    ...(user?.role === "admin" ? [
+      { to: "/users", icon: Users, label: "Users" },
+      { to: "/wcag-governance", icon: ShieldCheck, label: "WCAG Governance" }
+    ] : [])
   ];
 
   return (

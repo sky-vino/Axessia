@@ -7,7 +7,7 @@ import { format } from "date-fns";
 import {
   CheckCircle2, XCircle, Clock, Loader2,
   TrendingUp, TrendingDown, Minus, ExternalLink,
-  Filter, Search, X, RotateCcw
+  Filter, Search, X, RotateCcw, Trash2
 } from "lucide-react";
 import { AccordionChevron } from "../ui/AccordionChevron";
 import {
@@ -82,6 +82,7 @@ export default function HistoryTab() {
   const [nameFilter, setNameFilter] = useState("");
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [expandedScanId, setExpandedScanId] = useState<string | null>(null);
+  const [deleteScan, setDeleteScan] = useState<any | null>(null);
 
   const hasFilters = Boolean(dateFrom || dateTo || nameFilter.trim());
   const rerunMut = useMutation({
@@ -89,6 +90,13 @@ export default function HistoryTab() {
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["scans-history"] });
       navigate(`/scans/${res.data.scan.id}`);
+    },
+  });
+  const deleteMut = useMutation({
+    mutationFn: (scanId: string) => scanApi.delete(scanId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["scans-history"] });
+      setDeleteScan(null);
     },
   });
 
@@ -241,7 +249,7 @@ export default function HistoryTab() {
             <table className="w-full">
               <thead>
                 <tr className="border-b" style={{ borderColor: "rgba(255,255,255,0.05)" }}>
-                  {["", "Scan Name", "Status", "URLs", "Score", "Date", "Re-run"].map(h => (
+                  {["", "Scan Name", "Status", "URLs", "Score", "Date", "Actions"].map(h => (
                     <th key={h} className="text-left text-xs text-slate-600 font-semibold px-5 py-3">{h}</th>
                   ))}
                 </tr>
@@ -271,16 +279,28 @@ export default function HistoryTab() {
                         <td className="px-5 py-3.5">{scan.score != null ? <span className="text-sm font-bold" style={{ color: scan.score >= 80 ? "#22c55e" : scan.score >= 50 ? "#ffd60a" : "#ff4d6d" }}>{Math.round(scan.score)}</span> : <span className="text-slate-600">-</span>}</td>
                         <td className="px-5 py-3.5 text-xs text-slate-600 whitespace-nowrap">{format(new Date(scan.created_at), "MMM d, yyyy")}</td>
                         <td className="px-5 py-3.5">
-                          <button
-                            type="button"
-                            onClick={() => rerunMut.mutate(scan.id)}
-                            disabled={rerunMut.isPending}
-                            className="inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs text-accent transition-all hover:bg-accent/10 disabled:opacity-50"
-                            style={{ borderColor: "rgba(15,118,110,0.35)" }}
-                          >
-                            {rerunMut.isPending ? <Loader2 size={13} className="animate-spin" /> : <RotateCcw size={13} />}
-                            Re-run
-                          </button>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => rerunMut.mutate(scan.id)}
+                              disabled={rerunMut.isPending}
+                              className="inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs text-accent transition-all hover:bg-accent/10 disabled:opacity-50"
+                              style={{ borderColor: "rgba(15,118,110,0.35)" }}
+                            >
+                              {rerunMut.isPending ? <Loader2 size={13} className="animate-spin" /> : <RotateCcw size={13} />}
+                              Re-run
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setDeleteScan(scan)}
+                              disabled={deleteMut.isPending}
+                              className="inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs text-red-400 transition-all hover:bg-red-400/10 disabled:opacity-50"
+                              style={{ borderColor: "rgba(248,113,113,0.35)" }}
+                            >
+                              <Trash2 size={13} />
+                              Delete
+                            </button>
+                          </div>
                         </td>
                       </motion.tr>
                       {expanded && (
@@ -336,6 +356,37 @@ export default function HistoryTab() {
           </div>
         )}
       </motion.div>
+      {deleteScan && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center px-4" style={{ background: "rgba(0,0,0,0.48)" }}>
+          <div className="w-full max-w-md rounded-xl p-5 shadow-2xl" style={{ background: "var(--surface-1)", border: "1px solid var(--border-strong)" }}>
+            <div className="flex items-start justify-between gap-4 mb-4">
+              <div>
+                <h3 className="text-base font-semibold text-slate-100">Delete scan?</h3>
+                <p className="text-xs text-slate-500 mt-1">This action will be recorded in the admin audit trail.</p>
+              </div>
+              <button type="button" onClick={() => setDeleteScan(null)} className="text-slate-500 hover:text-slate-200" aria-label="Close dialog"><X size={16} /></button>
+            </div>
+            <div className="rounded-lg p-3 mb-4 space-y-1" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
+              <div className="text-sm text-slate-300">{deleteScan.name || "Untitled Scan"}</div>
+              <div className="text-xs font-mono text-slate-500">ID: {String(deleteScan.id || "").slice(0, 8).toUpperCase()}</div>
+            </div>
+            <p className="text-sm text-slate-400 leading-relaxed mb-5">Deleting removes the scan, issues, screenshots, and test cases from this workspace.</p>
+            <div className="flex items-center justify-end gap-2">
+              <button type="button" onClick={() => setDeleteScan(null)} className="px-3 py-2 text-xs rounded-lg border border-white/10 text-slate-400 hover:bg-white/[0.04]">Cancel</button>
+              <button
+                type="button"
+                onClick={() => deleteMut.mutate(deleteScan.id)}
+                disabled={deleteMut.isPending}
+                className="px-3 py-2 text-xs rounded-lg font-semibold inline-flex items-center gap-2 text-black"
+                style={{ background: "#f87171" }}
+              >
+                {deleteMut.isPending && <Loader2 size={13} className="animate-spin" />}
+                Delete scan
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

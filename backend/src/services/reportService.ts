@@ -68,6 +68,8 @@ function issueTitle(issue: any): string {
   if (/text.*clip|truncat/i.test(message)) return "Text content may be clipped or truncated";
   if (/meta-viewport/i.test(rule)) return "Mobile zoom is restricted";
   if (/label|input-no-label/i.test(rule)) return "Form control is missing a clear label";
+  if (/color:focus-indicator-low-contrast/i.test(rule)) return "Focus indicator contrast is too low";
+  if (/color:contrast-insufficient/i.test(rule)) return "Text contrast is too low";
   if (/color|contrast/i.test(rule)) return "Text or control contrast is too low";
   if (/focus:invisible/i.test(rule)) return "Keyboard focus indicator is not visible";
   if (/focus:trap|trap-missing/i.test(rule)) return "Keyboard focus can become trapped or unusable";
@@ -225,12 +227,13 @@ function hasReportSection(sections: Set<ReportSection>, section: ReportSection):
 
 export async function generateScanReport(scanId: string, requestedSections?: string[]): Promise<string> {
   const selectedSections = normalizeReportSections(requestedSections);
-  const [scanResult, issuesResult, testCasesResult] = await Promise.all([
+  const [scanResult, issuesResult, testCasesResult, snapshotsResult] = await Promise.all([
     db.query("SELECT s.*, u.full_name as created_by_name FROM scans s JOIN users u ON u.id = s.created_by WHERE s.id = $1", [scanId]),
     db.query(`SELECT * FROM issues WHERE scan_id = $1 AND COALESCE(false_positive, false) = false
       ORDER BY CASE WHEN is_resolved THEN 1 ELSE 0 END, priority ASC,
       CASE severity WHEN 'critical' THEN 1 WHEN 'serious' THEN 2 WHEN 'moderate' THEN 3 ELSE 4 END, created_at`, [scanId]),
     db.query("SELECT * FROM test_cases WHERE scan_id = $1 ORDER BY status, created_at", [scanId]),
+    db.query("SELECT url FROM dom_snapshots WHERE scan_id = $1 ORDER BY created_at", [scanId]),
   ]);
 
   const scan = scanResult.rows[0];
@@ -241,6 +244,21 @@ export async function generateScanReport(scanId: string, requestedSections?: str
   const resolvedIssues = issues.filter((issue: any) => issue.is_resolved);
   const testCases = testCasesResult.rows;
   const urls = asArray(scan.urls).map(String);
+  const navigatedUrls = [
+    ...new Set(
+      (asArray(scan.navigated_urls).length
+        ? asArray(scan.navigated_urls)
+        : [
+            ...urls,
+            ...snapshotsResult.rows.map((snapshot: any) => snapshot.url),
+            ...issues.map((issue: any) => issue.url),
+          ]
+      )
+        .map(String)
+        .map(url => url.trim())
+        .filter(Boolean)
+    )
+  ];
   const score = Math.round(Number(scan.score || 0));
   const completedAt = scan.completed_at ? new Date(scan.completed_at) : null;
 
@@ -365,7 +383,7 @@ export async function generateScanReport(scanId: string, requestedSections?: str
   const caseTypeOptions = ["automated", "manual", "hybrid"].filter(type => testCases.some((tc: any) => { const text = `${tc.category || ""} ${tc.status || ""}`.toLowerCase(); const actual = text.includes("hybrid") ? "hybrid" : text.includes("manual") ? "manual" : "automated"; return actual === type; })).map(type => `<label><input type="checkbox" data-case-filter="type" value="${type}"> ${type[0].toUpperCase()}${type.slice(1)}</label>`).join("");
   const stateCounts = issues.reduce((acc: Record<string, number>, issue: any) => { const state = issue.state_label || issue.phase || "default"; acc[state] = (acc[state] || 0) + 1; return acc; }, {});
   const stateRows = Object.entries(stateCounts).map(([state, count], index) => `<tr><td>${index + 1}</td><td>${escapeHtml(state)}</td><td>${count}</td><td>${issues.filter((issue: any) => (issue.state_label || issue.phase || "default") === state && issue.evidence_screenshot).length}</td></tr>`).join("");
-  const urlList = urls.map((url) => `<li title="${escapeAttr(url)}">${escapeHtml(compactUrl(url))}</li>`).join("");
+  const urlList = navigatedUrls.map((url, index) => `<li title="${escapeAttr(url)}"><span class="url-index">${index + 1}</span> ${escapeHtml(compactUrl(url))}</li>`).join("");
   const contentOptions = [
     ["executive", "Executive report"],
     ["summary", "Summary"],
@@ -454,6 +472,7 @@ export async function generateScanReport(scanId: string, requestedSections?: str
     .status { display:inline-flex; border-radius:999px; padding:3px 8px; font-size:11px; font-weight:800; }
     .status.pass { color:#047857; background:#ecfdf5; } .status.fail { color:#be123c; background:#fff1f2; } .status.pending { color:#475569; background:#f1f5f9; }
     .note { border:1px solid #d9deea; border-radius:10px; background:#fbfcff; padding:12px; color:#475569; }
+    .url-index { display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px; margin-right:6px; border-radius:999px; background:#eef2f7; color:#475569; font-size:11px; font-weight:700; }
     .details-row td { background:#fbfcff; }
     .details-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
     .details-grid section, .evidence, .selectors, .screenshot, .evidence-pack { border:1px solid #d9deea; border-radius:10px; padding:11px; background:#fff; margin-bottom:10px; }
@@ -636,7 +655,7 @@ export async function generateScanReport(scanId: string, requestedSections?: str
           <div class="metric"><strong>${score}/100</strong><span>Score</span></div>
           <div class="metric"><strong>${unresolvedIssues.length}</strong><span>Open issues</span></div>
           <div class="metric"><strong>${testCases.length}</strong><span>Test cases</span></div>
-          <div class="metric"><strong>${urls.length}</strong><span>URLs scanned</span></div>
+          <div class="metric"><strong>${navigatedUrls.length}</strong><span>URLs traversed</span></div>
           <div class="metric"><strong>${passCount}/${testCases.length || 0}</strong><span>Tests passed</span></div>
         </div>
       </header>
@@ -651,7 +670,7 @@ export async function generateScanReport(scanId: string, requestedSections?: str
           </div>
         </div>
       </section>
-      ${hasReportSection(selectedSections, "executive") ? `<section class="section" data-report-section="executive"><h2>Executive Report</h2><div class="note"><p><b>Overall position:</b> The scan produced a score of ${score}/100 with ${unresolvedIssues.length} unresolved issue groups and ${testCases.length} verification cases.</p><p><b>Immediate focus:</b> Prioritize ${sevCounts.critical || 0} critical and ${sevCounts.serious || 0} serious issue groups, then use the test case section to confirm fixes in real user flows.</p><p><b>Why test cases are shown first:</b> they translate scanner findings into pass, fail, and in-progress verification work that testers can execute and managers can track.</p></div></section>` : ""}
+      ${hasReportSection(selectedSections, "executive") ? `<section class="section" data-report-section="executive"><h2>Executive Report</h2><div class="note"><p><b>Overall position:</b> The scan produced a score of ${score}/100 with ${unresolvedIssues.length} unresolved issue groups, ${testCases.length} verification cases, and ${navigatedUrls.length} recorded navigation URL${navigatedUrls.length === 1 ? "" : "s"}.</p><p><b>Immediate focus:</b> Prioritize ${sevCounts.critical || 0} critical and ${sevCounts.serious || 0} serious issue groups, then use the test case section to confirm fixes in real user flows.</p><p><b>Why test cases are shown first:</b> they translate scanner findings into pass, fail, and in-progress verification work that testers can execute and managers can track.</p></div></section>` : ""}
 
       ${hasReportSection(selectedSections, "summary") ? `<section class="section" data-report-section="summary">
         <div class="summary-grid">
@@ -662,7 +681,7 @@ export async function generateScanReport(scanId: string, requestedSections?: str
             </div>
           </div>
           <div>
-            <h2>Scanned Pages</h2>
+            <h2>Navigation Trail</h2>
             <div class="url-box"><ul>${urlList || "<li>No URL recorded.</li>"}</ul></div>
           </div>
         </div>

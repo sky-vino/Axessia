@@ -14,6 +14,7 @@ const createScanSchema = z.object({
   project_id: z.string().uuid().optional(),
   state_label: z.string().optional().default("default"),
   auth_config: z.object({
+    workflow_type: z.enum(["generic", "sky"]).optional().default("generic"),
     login_url: z.string().url(),
     username_selector: z.string().trim().min(1),
     password_selector: z.string().trim().min(1),
@@ -45,6 +46,7 @@ const createScanSchema = z.object({
     run_motion: z.boolean().optional().default(true),
     run_reflow: z.boolean().optional().default(true),
     capture_screenshots: z.boolean().optional().default(true),
+    workflow_type: z.enum(["generic", "sky"]).optional().default("generic"),
     viewport_width: z.number().optional().default(1366),
     viewport_height: z.number().optional().default(768),
     headful: z.boolean().optional().default(false),

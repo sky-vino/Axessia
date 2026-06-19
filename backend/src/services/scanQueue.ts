@@ -3,6 +3,7 @@ import { db } from "../utils/db";
 import { logger } from "../utils/logger";
 import { wsManager } from "../utils/wsManager";
 import { AccessibilityScanner } from "../scanner/scanner";
+import { resolveGovernedWcagMapping } from "./wcagRuleRegistryService";
 
 interface QueueItem {
   scanId: string;
@@ -80,7 +81,7 @@ class ScanQueue {
 
     try {
       await db.query(
-        "UPDATE scans SET status = 'running', started_at = NOW(), progress = 0 WHERE id = $1",
+        "UPDATE scans SET status = 'running', started_at = NOW(), progress = 0, navigated_urls = NULL WHERE id = $1",
         [scanId]
       );
 
@@ -95,26 +96,32 @@ class ScanQueue {
         wsManager.broadcast(scanId, { type: "scan:progress", scanId, progress, message });
       });
 
-      const { issues, testCases, domSnapshots, score } = await scanner.run();
+      const { issues, testCases, domSnapshots, navigatedUrls, score } = await scanner.run();
       const issueIdsByRuleUrl = new Map<string, string>();
       const issueLinkKey = (ruleId: string, url: string) => `${ruleId}|${url}`;
 
       // Persist issues
       for (const issue of issues) {
+        const governedMapping = await resolveGovernedWcagMapping(issue);
+        const governedTags = Array.from(new Set([
+          ...(issue.tags || []),
+          `wcag-mapping:${governedMapping.mappingStatus}`
+        ]));
         const insertedIssue = await db.query(
           `INSERT INTO issues (scan_id, rule_id, severity, priority, category, message, url,
-            selector, selectors, depths, wcag_criteria, act_rules, tags, help_url, html_snippet,
+            selector, selectors, affected_elements, depths, wcag_criteria, act_rules, tags, help_url, html_snippet,
             fix_suggestion, evidence_screenshot, evidence_explanation, component_id, component_owner, source_hint, state_label, phase)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) RETURNING id`,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING id`,
           [
             scanId, issue.ruleId, issue.severity, issue.priority || 3,
             issue.category || "wcag", issue.message, issue.url,
             issue.selector || null,
             issue.selectors?.length ? issue.selectors : null,
+            issue.affectedElements?.length ? issue.affectedElements : null,
             issue.depths?.length ? issue.depths : null,
-            issue.wcag?.length ? issue.wcag : null,
+            governedMapping.wcag.length ? governedMapping.wcag : null,
             issue.act?.length ? issue.act : null,
-            issue.tags?.length ? issue.tags : null,
+            governedTags.length ? governedTags : null,
             issue.helpUrl || null,
             issue.htmlSnippet || null,
             issue.fixSuggestion || null,
@@ -160,17 +167,18 @@ class ScanQueue {
       await db.query(
         `UPDATE scans SET status = 'completed', completed_at = NOW(), progress = 100,
           total_issues = $2, critical_count = $3, serious_count = $4,
-          moderate_count = $5, minor_count = $6, score = $7
+          moderate_count = $5, minor_count = $6, score = $7, navigated_urls = $8
          WHERE id = $1`,
         [scanId, issues.length,
           counts.critical || 0, counts.serious || 0,
           counts.moderate || 0, counts.minor || 0,
-          score
+          score,
+          navigatedUrls
         ]
       );
 
-      wsManager.broadcast(scanId, { type: "scan:completed", scanId, totalIssues: issues.length, score, message: `SUCCESS: Scan completed with ${issues.length} issues and score ${score}` });
-      logger.info(`Scan ${scanId} completed with ${issues.length} issues`);
+      wsManager.broadcast(scanId, { type: "scan:completed", scanId, totalIssues: issues.length, score, navigatedUrls, message: `SUCCESS: Scan completed with ${issues.length} issues and score ${score}` });
+      logger.info(`Scan ${scanId} completed with ${issues.length} issues; navigated through ${navigatedUrls.length} URL${navigatedUrls.length === 1 ? "" : "s"}`);
 
     } catch (err: any) {
       logger.error(`Scan ${scanId} failed:`, err);

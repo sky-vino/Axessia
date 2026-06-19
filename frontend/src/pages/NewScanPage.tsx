@@ -13,6 +13,66 @@ const AUTHENTICATED_PAGE_OPTIONS = [
   "Scopri l'app My Sky",
 ];
 
+const GENERIC_AUTH_DEFAULTS = {
+  login_url: "",
+  username_selector: "",
+  password_selector: "",
+  submit_selector: "",
+  username: "",
+  password: "",
+  otp_from_page: false,
+  otp_selector: "",
+  otp_source_selector: "",
+  otp_code: "",
+  otp_submit_selector: "",
+  auto_accept_cookies: true,
+  cookie_accept_selector: "",
+  profile_url: "",
+};
+
+const SKY_AUTH_DEFAULTS = {
+  login_url: "",
+  username_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-email')\n//input[@id='sky-login-email']\n#sky-login-email",
+  password_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('div.sky-login-label-password login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-password')\n//input[@id='sky-login-password']\n#sky-login-password",
+  submit_selector: "js=document.querySelector('sky-login-component#sky-login button.sky-login-submit[type=\"submit\"]')\n//button[@class='sky-login-submit']\n//button[contains(@class,'sky-login-submit')]\nbutton.sky-login-submit[type='submit']",
+  username: "",
+  password: "",
+  otp_from_page: true,
+  otp_selector: "input.otp-input_otp-input__QvpEl\ninput[aria-label^='Please enter OTP character'], input[name*='otp' i], div[role='textbox'], [contenteditable='true']",
+  otp_source_selector: "div.otp-verify-sms-content > p",
+  otp_code: "",
+  otp_submit_selector: "js=document.querySelector(\"button.sky-button-primary[aria-label='Conferma']\")\n//button[normalize-space()='Conferma']\n//button[@aria-label='Conferma' and contains(@class,'sky-button-primary')]\nbutton.sky-button-primary[aria-label='Conferma']",
+  auto_accept_cookies: true,
+  cookie_accept_selector: "js=document.querySelector('#notice button.accbtn[aria-label=\"Accetta tutto\"]')\n//button[@title='Accetta tutto']\n//*[@id='notice']//button[@aria-label='Accetta tutto' or normalize-space()='Accetta tutto']",
+  profile_url: "",
+};
+
+type ScanFormOptions = {
+  run_axe: boolean;
+  run_heuristics: boolean;
+  run_focus: boolean;
+  run_keyboard_nav: boolean;
+  run_zoom: boolean;
+  run_color: boolean;
+  run_pointer: boolean;
+  run_live_dom: boolean;
+  run_states: boolean;
+  run_dynamic: boolean;
+  run_motion: boolean;
+  run_reflow: boolean;
+  capture_screenshots: boolean;
+  workflow_type: "generic" | "sky";
+  crawl_mode: boolean;
+  crawl_depth: number;
+  crawl_same_domain: boolean;
+  crawl_max_pages: number;
+  scan_login_page: boolean;
+  scan_post_login_landing: boolean;
+  post_login_tab_scan: boolean;
+  post_login_tab_limit: number;
+  post_login_pages: string[];
+};
+
 function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
   return (
     <label className="flex items-center gap-3 cursor-pointer">
@@ -31,37 +91,24 @@ export default function NewScanPage() {
   const [urls, setUrls] = useState([""]);
   const [name, setName] = useState("");
   const [stateLabel, setStateLabel] = useState("default");
+  const [workflowType, setWorkflowType] = useState<"generic" | "sky">("generic");
   const [showAuth, setShowAuth] = useState(false);
-  const [auth, setAuth] = useState({
-    login_url: "",
-    username_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-email')\n//input[@id='sky-login-email']\n#sky-login-email",
-    password_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('div.sky-login-label-password login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-password')\n//input[@id='sky-login-password']\n#sky-login-password",
-    submit_selector: "js=document.querySelector('sky-login-component#sky-login button.sky-login-submit[type=\"submit\"]')\n//button[@class='sky-login-submit']\n//button[contains(@class,'sky-login-submit')]\nbutton.sky-login-submit[type='submit']",
-    username: "",
-    password: "",
-    otp_from_page: true,
-    otp_selector: "input.otp-input_otp-input__QvpEl\ninput[aria-label^='Please enter OTP character'], input[name*='otp' i], div[role='textbox'], [contenteditable='true']",
-    otp_source_selector: "div.otp-verify-sms-content > p",
-    otp_code: "",
-    otp_submit_selector: "js=document.querySelector(\"button.sky-button-primary[aria-label='Conferma']\")\n//button[normalize-space()='Conferma']\n//button[@aria-label='Conferma' and contains(@class,'sky-button-primary')]\nbutton.sky-button-primary[aria-label='Conferma']",
-    auto_accept_cookies: true,
-    cookie_accept_selector: "js=document.querySelector('#notice button.accbtn[aria-label=\"Accetta tutto\"]')\n//button[@title='Accetta tutto']\n//*[@id='notice']//button[@aria-label='Accetta tutto' or normalize-space()='Accetta tutto']",
-    profile_url: "",
-  });
-  const [opts, setOpts] = useState({
+  const [auth, setAuth] = useState(GENERIC_AUTH_DEFAULTS);
+  const [opts, setOpts] = useState<ScanFormOptions>({
     run_axe: true, run_heuristics: true, run_focus: true, run_keyboard_nav: true,
     run_zoom: true, run_color: true, run_pointer: true, run_live_dom: true,
     run_states: true, run_dynamic: true, run_motion: true, run_reflow: true,
     capture_screenshots: true,
+    workflow_type: "generic",
     crawl_mode: false,
     crawl_depth: 2,
     crawl_same_domain: true,
     crawl_max_pages: 30,
-    scan_login_page: true,
+    scan_login_page: false,
     scan_post_login_landing: true,
-    post_login_tab_scan: true,
+    post_login_tab_scan: false,
     post_login_tab_limit: 12,
-    post_login_pages: AUTHENTICATED_PAGE_OPTIONS,
+    post_login_pages: [],
   });
   const [crawlIncludeText, setCrawlIncludeText] = useState("");
   const [crawlExcludeText, setCrawlExcludeText] = useState("");
@@ -84,6 +131,7 @@ export default function NewScanPage() {
       s.split(/[\n,]+/).map(x => x.trim()).filter(Boolean).slice(0, 30);
     const authPayload = {
       ...auth,
+      workflow_type: workflowType,
       username_selector: auth.username_selector.trim(),
       password_selector: auth.password_selector.trim(),
       submit_selector: auth.submit_selector.trim(),
@@ -100,13 +148,28 @@ export default function NewScanPage() {
       auth_config: showAuth && auth.login_url ? authPayload : undefined,
       scan_options: {
         ...opts,
+        workflow_type: workflowType,
         crawl_depth: Math.max(0, Math.min(10, Number(opts.crawl_depth) || 0)),
         crawl_max_pages: Math.max(1, Math.min(200, Number(opts.crawl_max_pages) || 30)),
         crawl_include_patterns: splitPatterns(crawlIncludeText),
         crawl_exclude_patterns: splitPatterns(crawlExcludeText),
-        post_login_pages: selectedPostLoginPages,
+        post_login_pages: workflowType === "sky" ? selectedPostLoginPages : [],
       }
     });
+  };
+
+  const handleWorkflowChange = (value: "generic" | "sky") => {
+    setWorkflowType(value);
+    if (value === "sky") {
+      setShowAuth(true);
+      setAuth(current => ({ ...SKY_AUTH_DEFAULTS, login_url: current.login_url, username: current.username, password: current.password }));
+      setSelectedPostLoginPages(AUTHENTICATED_PAGE_OPTIONS);
+      setOpts(current => ({ ...current, workflow_type: "sky", scan_login_page: true, post_login_tab_scan: true, post_login_pages: AUTHENTICATED_PAGE_OPTIONS }));
+    } else {
+      setAuth(current => ({ ...GENERIC_AUTH_DEFAULTS, login_url: current.login_url, username: current.username, password: current.password }));
+      setSelectedPostLoginPages([]);
+      setOpts(current => ({ ...current, workflow_type: "generic", scan_login_page: false, post_login_tab_scan: false, post_login_pages: [] }));
+    }
   };
 
   const togglePostLoginPage = (label: string) => {
@@ -272,8 +335,19 @@ export default function NewScanPage() {
           {showAuth && (
             <div className="px-6 pb-6 space-y-4 border-t" style={{ borderColor: "rgba(255,255,255,0.05)" }}>
               <p className="text-xs text-slate-600 mt-4 leading-relaxed">
-                Use this when the target pages need a logged-in session. The scanner will log in first, accept cookies if enabled, then scan or crawl with the same browser session.
+                Use generic workflow for normal authenticated sites. Use Sky workflow only for the Sky login, OTP, Gestisci, and selected post-login page journey.
               </p>
+              <div>
+                <label className="block text-xs text-slate-500 mb-1.5">Workflow</label>
+                <select
+                  style={inputStyle}
+                  value={workflowType}
+                  onChange={e => handleWorkflowChange(e.target.value as "generic" | "sky")}
+                >
+                  <option value="generic">Generic website workflow</option>
+                  <option value="sky">Sky authenticated workflow</option>
+                </select>
+              </div>
               <div>
                 <label className="block text-xs text-slate-500 mb-1.5">Login URL</label>
                 <input style={inputStyle} type="url" placeholder="https://example.com/login"
@@ -294,18 +368,80 @@ export default function NewScanPage() {
                 </div>
               </div>
 
+              <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }}>
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1.5">Username selector</label>
+                  <textarea rows={3} style={{ ...inputStyle, minHeight: 84, resize: "vertical" }}
+                    placeholder="#email or input[name='username']"
+                    value={auth.username_selector}
+                    onChange={e => setAuth({ ...auth, username_selector: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1.5">Password selector</label>
+                  <textarea rows={3} style={{ ...inputStyle, minHeight: 84, resize: "vertical" }}
+                    placeholder="input[type='password']"
+                    value={auth.password_selector}
+                    onChange={e => setAuth({ ...auth, password_selector: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1.5">Submit selector</label>
+                  <textarea rows={3} style={{ ...inputStyle, minHeight: 84, resize: "vertical" }}
+                    placeholder="button[type='submit']"
+                    value={auth.submit_selector}
+                    onChange={e => setAuth({ ...auth, submit_selector: e.target.value })}
+                  />
+                </div>
+              </div>
+
               <div className="rounded-xl p-4 space-y-3" style={{ background: "rgba(255,255,255,0.025)", border: "1px solid var(--border)" }}>
                 <Toggle checked={Boolean(auth.auto_accept_cookies)} onChange={v => setAuth({ ...auth, auto_accept_cookies: v })} label="Accept all cookie prompts automatically" />
-                <Toggle checked={Boolean(auth.otp_from_page)} onChange={v => setAuth({ ...auth, otp_from_page: v })} label="OTP is shown on the login page and can be read automatically" />
-                {!auth.otp_from_page && (
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1.5">Cookie accept selector (optional)</label>
+                  <textarea rows={2} style={{ ...inputStyle, minHeight: 64, resize: "vertical" }}
+                    placeholder="button:has-text('Accept all')"
+                    value={auth.cookie_accept_selector}
+                    onChange={e => setAuth({ ...auth, cookie_accept_selector: e.target.value })}
+                  />
+                </div>
+                <Toggle checked={Boolean(auth.otp_from_page)} onChange={v => setAuth({ ...auth, otp_from_page: v })} label={workflowType === "sky" ? "OTP is shown on the Sky page and can be read automatically" : "This generic login has an OTP step"} />
+                {auth.otp_from_page ? (
+                  <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }}>
+                    <div>
+                      <label className="block text-xs text-slate-500 mb-1.5">OTP text/source selector</label>
+                      <textarea rows={2} style={{ ...inputStyle, minHeight: 64, resize: "vertical" }}
+                        placeholder="Selector containing OTP text"
+                        value={auth.otp_source_selector}
+                        onChange={e => setAuth({ ...auth, otp_source_selector: e.target.value })}
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-slate-500 mb-1.5">OTP input selector</label>
+                      <textarea rows={2} style={{ ...inputStyle, minHeight: 64, resize: "vertical" }}
+                        placeholder="input[name*='otp']"
+                        value={auth.otp_selector}
+                        onChange={e => setAuth({ ...auth, otp_selector: e.target.value })}
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-slate-500 mb-1.5">OTP submit selector</label>
+                      <textarea rows={2} style={{ ...inputStyle, minHeight: 64, resize: "vertical" }}
+                        placeholder="button:has-text('Confirm')"
+                        value={auth.otp_submit_selector}
+                        onChange={e => setAuth({ ...auth, otp_submit_selector: e.target.value })}
+                      />
+                    </div>
+                  </div>
+                ) : (
                   <div className="pt-2">
-                    <label className="block text-xs text-slate-500 mb-1.5">OTP Code</label>
+                    <label className="block text-xs text-slate-500 mb-1.5">Manual OTP Code (optional)</label>
                     <input style={inputStyle} placeholder="Enter OTP for this scan"
                       value={auth.otp_code} onChange={e => setAuth({ ...auth, otp_code: e.target.value })} />
                   </div>
                 )}
               </div>
-              <div>
+              {workflowType === "sky" && <div>
                 <label className="block text-xs text-slate-500 mb-1.5">Authenticated pages to scan after Gestisci</label>
                 <div className="grid gap-2" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))" }}>
                   {AUTHENTICATED_PAGE_OPTIONS.map(label => (
@@ -327,7 +463,7 @@ export default function NewScanPage() {
                 <p className="text-[11px] text-slate-600 mt-2 leading-relaxed">
                   The scanner logs in, scans Gestisci, checks keyboard tab access between these navigation items, then fully scans each selected page.
                 </p>
-              </div>
+              </div>}
             </div>
           )}
         </motion.div>

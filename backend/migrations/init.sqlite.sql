@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS scans (
   created_by      TEXT NOT NULL REFERENCES users(id),
   name            TEXT,
   urls            TEXT NOT NULL,
+  navigated_urls  TEXT,
   state_label     TEXT NOT NULL DEFAULT 'default',
   scan_options    TEXT NOT NULL DEFAULT '{}',
   auth_config     TEXT,
@@ -70,6 +71,7 @@ CREATE TABLE IF NOT EXISTS issues (
   url             TEXT NOT NULL,
   selector        TEXT,
   selectors       TEXT,
+  affected_elements TEXT,
   depths          TEXT,
   wcag_criteria   TEXT,
   act_rules       TEXT,
@@ -139,3 +141,61 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events(actor_id);
 CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS wcag_metadata (
+  criterion   TEXT PRIMARY KEY,
+  title       TEXT NOT NULL,
+  level       TEXT,
+  principle   TEXT,
+  url         TEXT,
+  source      TEXT,
+  fetched_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS wcag_mapping_reviews (
+  id             TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(6)))),
+  rule_id        TEXT NOT NULL,
+  current_wcag   TEXT NOT NULL,
+  suggested_wcag TEXT,
+  reason         TEXT NOT NULL,
+  status         TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','dismissed','resolved')),
+  first_seen_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  resolved_at    TEXT,
+  UNIQUE(rule_id, current_wcag, reason)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wcag_mapping_reviews_status ON wcag_mapping_reviews(status);
+CREATE INDEX IF NOT EXISTS idx_wcag_mapping_reviews_last_seen ON wcag_mapping_reviews(last_seen_at DESC);
+
+CREATE TABLE IF NOT EXISTS wcag_rule_registry (
+  rule_id             TEXT PRIMARY KEY,
+  rule_name           TEXT NOT NULL,
+  category            TEXT,
+  default_wcag        TEXT NOT NULL DEFAULT '[]',
+  approved_wcag       TEXT NOT NULL DEFAULT '[]',
+  mapping_status      TEXT NOT NULL DEFAULT 'review_required' CHECK (mapping_status IN ('approved','review_required','rejected','obsolete','advisory')),
+  review_status       TEXT NOT NULL DEFAULT 'pending' CHECK (review_status IN ('pending','approved','rejected','resolved')),
+  source_module       TEXT,
+  rationale           TEXT,
+  last_reviewed_by    TEXT REFERENCES users(id) ON DELETE SET NULL,
+  last_reviewed_at    TEXT,
+  created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS wcag_mapping_decisions (
+  id               TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(2))) || '-' || lower(hex(randomblob(6)))),
+  rule_id          TEXT NOT NULL REFERENCES wcag_rule_registry(rule_id) ON DELETE CASCADE,
+  previous_wcag    TEXT,
+  decided_wcag     TEXT NOT NULL DEFAULT '[]',
+  decision         TEXT NOT NULL CHECK (decision IN ('accepted','dismissed','resolved','registered','auto_review_required')),
+  reason           TEXT,
+  decided_by       TEXT REFERENCES users(id) ON DELETE SET NULL,
+  decided_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_wcag_rule_registry_status ON wcag_rule_registry(mapping_status, review_status);
+CREATE INDEX IF NOT EXISTS idx_wcag_rule_registry_updated ON wcag_rule_registry(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_wcag_mapping_decisions_rule ON wcag_mapping_decisions(rule_id);
+CREATE INDEX IF NOT EXISTS idx_wcag_mapping_decisions_date ON wcag_mapping_decisions(decided_at DESC);

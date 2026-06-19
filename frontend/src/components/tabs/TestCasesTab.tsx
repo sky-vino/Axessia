@@ -381,7 +381,7 @@ export default function TestCasesTab({ scanId }: { scanId: string }) {
                   )}
                 </div>
                 <label className="block space-y-1">
-                  <span className="text-[10px] uppercase tracking-wide text-slate-600">Status subtype: page</span>
+                  <span className="text-[10px] uppercase tracking-wide text-slate-600">Pages</span>
                   <select value={pageFilter} onChange={e => setPageFilter(e.target.value)} className="w-full px-3 py-2 rounded-lg text-sm text-slate-300 outline-none" style={{ background: "var(--input-bg)", border: "1px solid var(--border-strong)" }}>
                     <option value="">All selected pages</option>
                     {pageOptions.map(label => <option key={label} value={label}>{label}</option>)}
@@ -472,7 +472,6 @@ export default function TestCasesTab({ scanId }: { scanId: string }) {
     </div>
   );
 }
-
 
 
 
