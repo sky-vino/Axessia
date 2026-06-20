@@ -9,6 +9,17 @@ import { logger } from "../utils/logger";
 
 type Evidence = Pick<ScanIssue, "evidenceScreenshot" | "evidenceExplanation">;
 
+type UiSnapshot = {
+  viewport: { width: number; height: number; scrollWidth: number; scrollHeight: number };
+  scroll: { x: number; y: number };
+  visibleTransients: string[];
+  expandedTriggers: string[];
+  bodyOverflow: string;
+  htmlOverflow: string;
+  bodyTransform: string;
+  activeElement: string | null;
+};
+
 async function closeTransientUi(page: Page): Promise<void> {
   await page.keyboard.press("Escape").catch(() => undefined);
   await page.mouse.click(2, 2).catch(() => undefined);
@@ -24,12 +35,88 @@ async function closeTransientUi(page: Page): Promise<void> {
       const visible = rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
       if (visible && !el.matches("nav,main,header,footer")) {
         el.setAttribute("data-aft-transient-reset", "true");
+        if (!el.hasAttribute("data-aft-original-style")) {
+          el.setAttribute("data-aft-original-style", el.getAttribute("style") ?? "__AFT_NO_STYLE__");
+        }
         el.style.setProperty("display", "none", "important");
       }
     });
     (document.activeElement as HTMLElement | null)?.blur?.();
   }).catch(() => undefined);
   await page.waitForTimeout(150).catch(() => undefined);
+}
+
+async function restoreInjectedUi(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    document.getElementById("aft-text-spacing-test")?.remove();
+    document.querySelectorAll<HTMLElement>("[data-aft-original-style]").forEach((el) => {
+      const original = el.getAttribute("data-aft-original-style");
+      if (original === "__AFT_NO_STYLE__") el.removeAttribute("style");
+      else if (original !== null) el.setAttribute("style", original);
+      el.removeAttribute("data-aft-original-style");
+      el.removeAttribute("data-aft-transient-reset");
+    });
+    document.querySelectorAll<HTMLElement>("[data-aft-evidence-highlight]").forEach((el) => {
+      el.style.removeProperty("outline");
+      el.style.removeProperty("outline-offset");
+      el.removeAttribute("data-aft-evidence-highlight");
+    });
+  }).catch(() => undefined);
+}
+
+async function naturallyCloseTransientUi(page: Page): Promise<void> {
+  await page.keyboard.press("Escape").catch(() => undefined);
+  await page.mouse.click(2, 2).catch(() => undefined);
+  await page.waitForTimeout(150).catch(() => undefined);
+}
+
+async function captureUiSnapshot(page: Page): Promise<UiSnapshot> {
+  return page.evaluate(() => {
+    const selectorFor = (el: Element | null): string | null => {
+      if (!el) return null;
+      const html = el as HTMLElement;
+      if (html.id) return `${html.tagName.toLowerCase()}#${CSS.escape(html.id)}`;
+      const ariaLabel = html.getAttribute("aria-label");
+      if (ariaLabel && ariaLabel.length < 80) return `${html.tagName.toLowerCase()}[aria-label="${CSS.escape(ariaLabel)}"]`;
+      const controls = html.getAttribute("aria-controls");
+      if (controls) return `${html.tagName.toLowerCase()}[aria-controls="${CSS.escape(controls)}"]`;
+      const parent = html.parentElement;
+      let selector = html.tagName.toLowerCase();
+      if (parent) {
+        const siblings = Array.from(parent.children).filter((child) => child.tagName === html.tagName);
+        if (siblings.length > 1) selector += `:nth-of-type(${siblings.indexOf(html) + 1})`;
+      }
+      return selector;
+    };
+    const visible = (el: Element) => {
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" &&
+        style.opacity !== "0" && !el.closest("[hidden],[inert],[aria-hidden='true']");
+    };
+    const transientSelector = "[role='menu'],[role='listbox'],[role='dialog'],[aria-modal='true'],.dropdown-menu,.menu,.popover,.tooltip,[data-popper-placement]";
+    const visibleTransients = Array.from(document.querySelectorAll(transientSelector))
+      .filter(visible).map(selectorFor).filter(Boolean) as string[];
+    const expandedTriggers = Array.from(document.querySelectorAll("[aria-expanded='true']"))
+      .filter(visible).map(selectorFor).filter(Boolean) as string[];
+    const bodyStyle = getComputedStyle(document.body);
+    const htmlStyle = getComputedStyle(document.documentElement);
+    return {
+      viewport: {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        scrollWidth: document.documentElement.scrollWidth,
+        scrollHeight: document.documentElement.scrollHeight
+      },
+      scroll: { x: window.scrollX, y: window.scrollY },
+      visibleTransients: Array.from(new Set(visibleTransients)),
+      expandedTriggers: Array.from(new Set(expandedTriggers)),
+      bodyOverflow: `${bodyStyle.overflowX}/${bodyStyle.overflowY}`,
+      htmlOverflow: `${htmlStyle.overflowX}/${htmlStyle.overflowY}`,
+      bodyTransform: bodyStyle.transform,
+      activeElement: selectorFor(document.activeElement)
+    };
+  });
 }
 
 async function screenshotEvidence(page: Page, explanation: string): Promise<Evidence> {
@@ -79,6 +166,8 @@ export async function runZoomChecks(
 ): Promise<ScanIssue[]> {
   const issues: ScanIssue[] = [];
   const zoomViewport = { width: 320, height: 568 };
+  const originalVp = page.viewportSize() || { width: 1366, height: 768 };
+  let baseline: UiSnapshot | null = null;
 
   const zoomLocked = await page.evaluate(() => {
     const meta = document.querySelector("meta[name='viewport']") as HTMLMetaElement | null;
@@ -132,8 +221,89 @@ export async function runZoomChecks(
   }
 
   try {
-    const originalVp = page.viewportSize() || { width: 1366, height: 768 };
+    baseline = await captureUiSnapshot(page);
     await closeTransientUi(page);
+
+    const intermediateFailures: Array<{
+      zoomPercent: number;
+      viewport: { width: number; height: number; scrollWidth: number };
+      offenders: Array<{ selector: string; text: string; right: number; width: number; clipped: boolean }>;
+    }> = [];
+    for (const zoomPercent of [200, 300]) {
+      const factor = zoomPercent / 100;
+      const viewport = {
+        width: Math.max(320, Math.round(originalVp.width / factor)),
+        height: Math.max(320, Math.round(originalVp.height / factor))
+      };
+      await page.setViewportSize(viewport);
+      await page.waitForTimeout(350);
+      const probe = await page.evaluate(() => {
+        const selectorFor = (el: HTMLElement) => {
+          if (el.id) return `${el.tagName.toLowerCase()}#${CSS.escape(el.id)}`;
+          const label = el.getAttribute("aria-label");
+          if (label && label.length < 60) return `${el.tagName.toLowerCase()}[aria-label="${CSS.escape(label)}"]`;
+          return el.tagName.toLowerCase();
+        };
+        const offenders: Array<{ selector: string; text: string; right: number; width: number; clipped: boolean }> = [];
+        document.querySelectorAll<HTMLElement>("body *").forEach((el) => {
+          const rect = el.getBoundingClientRect();
+          const style = getComputedStyle(el);
+          const visible = rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && !el.closest("[hidden],[inert],[aria-hidden='true']");
+          if (!visible || style.position === "fixed" || style.position === "sticky") return;
+          const hasText = (el.textContent || "").trim().length > 1;
+          const clipped = hasText && (el.scrollWidth > el.clientWidth + 2 || el.scrollHeight > el.clientHeight + 2 || style.textOverflow === "ellipsis" || Boolean((style as any).webkitLineClamp));
+          if (rect.right > window.innerWidth + 2 || clipped) {
+            offenders.push({
+              selector: selectorFor(el),
+              text: (el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 80),
+              right: Math.round(rect.right),
+              width: Math.round(rect.width),
+              clipped
+            });
+          }
+        });
+        return {
+          viewport: { width: window.innerWidth, height: window.innerHeight, scrollWidth: document.documentElement.scrollWidth },
+          offenders: Array.from(new Map(offenders.map((item) => [item.selector, item])).values()).slice(0, 12)
+        };
+      });
+      if (probe.offenders.length || probe.viewport.scrollWidth > probe.viewport.width + 5) {
+        intermediateFailures.push({ zoomPercent, viewport: probe.viewport, offenders: probe.offenders });
+      }
+    }
+
+    if (intermediateFailures.length) {
+      const first = intermediateFailures[0];
+      await page.setViewportSize({ width: first.viewport.width, height: first.viewport.height });
+      await page.waitForTimeout(200);
+      const selector = first.offenders[0]?.selector || "body";
+      const evidence = await screenshotEvidenceForSelector(
+        page,
+        selector,
+        `Issue-specific evidence captured at the ${first.zoomPercent}% equivalent viewport (${first.viewport.width}x${first.viewport.height}). The highlighted element is the first overflow or clipping offender.`,
+        false
+      );
+      issues.push({
+        ruleId: "zoom:intermediate-breakpoint-failure",
+        severity: "serious",
+        priority: 2,
+        category: "zoom",
+        message: `Content clips or overflows at ${intermediateFailures.map((item) => `${item.zoomPercent}%`).join(" and ")} zoom-equivalent breakpoints.`,
+        url,
+        selector,
+        selectors: Array.from(new Set(intermediateFailures.flatMap((item) => item.offenders.map((offender) => offender.selector)))),
+        affectedElements: intermediateFailures.flatMap((item) => item.offenders.map((offender) => `${item.zoomPercent}%: ${offender.selector} (${offender.width}px wide, right=${offender.right}, clipped=${offender.clipped})`)),
+        depths: intermediateFailures.flatMap((item) => item.offenders.map(() => 0)),
+        wcag: ["wcag1.4.4", "wcag1.4.10"],
+        fixSuggestion: "Test responsive breakpoints throughout 200%-400% zoom, allow wrapping, and avoid layouts that only recover at the smallest mobile breakpoint.",
+        state,
+        phase: `${phase}:intermediate`,
+        htmlSnippet: JSON.stringify(intermediateFailures, null, 2),
+        ...evidence
+      });
+      await closeTransientUi(page);
+    }
+
     await page.setViewportSize(zoomViewport);
     await page.waitForTimeout(600);
     await closeTransientUi(page);
@@ -635,13 +805,70 @@ export async function runZoomChecks(
         ...spacingEvidence
       });
     }
-    await page.evaluate(() => document.getElementById("aft-text-spacing-test")?.remove()).catch(() => undefined);
-    await closeTransientUi(page);
-
+    await restoreInjectedUi(page);
     await page.setViewportSize(originalVp);
-    await page.waitForTimeout(300);
+    if (baseline) {
+      await page.evaluate(({ x, y }) => window.scrollTo(x, y), baseline.scroll).catch(() => undefined);
+    }
+    await page.waitForTimeout(500);
+
+    const recovered = await captureUiSnapshot(page);
+    const baselineTransients = new Set(baseline?.visibleTransients || []);
+    const baselineExpanded = new Set(baseline?.expandedTriggers || []);
+    const persistentTransients = recovered.visibleTransients.filter((selector) => !baselineTransients.has(selector));
+    const persistentExpanded = recovered.expandedTriggers.filter((selector) => !baselineExpanded.has(selector));
+    const viewportMismatch = recovered.viewport.width !== originalVp.width || recovered.viewport.height !== originalVp.height;
+    const baselineHadHorizontalOverflow = baseline ? baseline.viewport.scrollWidth > baseline.viewport.width + 5 : false;
+    const introducedHorizontalOverflow = !baselineHadHorizontalOverflow && recovered.viewport.scrollWidth > recovered.viewport.width + 5;
+    const overflowLockChanged = Boolean(baseline) && (recovered.bodyOverflow !== baseline!.bodyOverflow || recovered.htmlOverflow !== baseline!.htmlOverflow) &&
+      /hidden/.test(`${recovered.bodyOverflow}/${recovered.htmlOverflow}`);
+    const transformPersisted = Boolean(baseline) && recovered.bodyTransform !== baseline!.bodyTransform && recovered.bodyTransform !== "none";
+
+    if (persistentTransients.length || persistentExpanded.length || viewportMismatch || introducedHorizontalOverflow || overflowLockChanged || transformPersisted) {
+      const selector = persistentTransients[0] || persistentExpanded[0] || "body";
+      const evidence = await screenshotEvidenceForSelector(
+        page,
+        selector,
+        `Post-zoom recovery evidence captured after restoring the original ${originalVp.width}x${originalVp.height} viewport. The highlighted element or page state remained inconsistent with the pre-zoom baseline.`,
+        false
+      );
+      const reasons = [
+        persistentTransients.length ? `${persistentTransients.length} popup/dialog surface(s) remained visible` : "",
+        persistentExpanded.length ? `${persistentExpanded.length} trigger(s) remained expanded` : "",
+        viewportMismatch ? `viewport restored as ${recovered.viewport.width}x${recovered.viewport.height} instead of ${originalVp.width}x${originalVp.height}` : "",
+        introducedHorizontalOverflow ? "new horizontal overflow remained after restoration" : "",
+        overflowLockChanged ? "a page scroll lock remained after restoration" : "",
+        transformPersisted ? "a body transform remained after restoration" : ""
+      ].filter(Boolean);
+      const selectors = Array.from(new Set([...persistentTransients, ...persistentExpanded, ...(reasons.length ? [] : ["body"])]));
+      issues.push({
+        ruleId: "zoom:viewport-restoration-failure",
+        severity: "serious",
+        priority: 1,
+        category: "zoom",
+        message: `The page did not return to its pre-zoom state: ${reasons.join("; ")}.`,
+        url,
+        selector,
+        selectors: selectors.length ? selectors : ["body"],
+        affectedElements: reasons,
+        depths: (selectors.length ? selectors : ["body"]).map(() => 0),
+        wcag: ["wcag1.4.10", "wcag1.4.13", "wcag3.2.2"],
+        fixSuggestion: "On viewport restoration, recalculate popup placement, close transient expanded content when appropriate, release scroll locks, remove zoom transforms, and restore responsive layout state.",
+        state,
+        phase: `${phase}:recovery`,
+        htmlSnippet: JSON.stringify({ baseline, recovered, persistentTransients, persistentExpanded, reasons }, null, 2),
+        ...evidence
+      });
+    }
   } catch (err) {
     logger.debug("Zoom checks failed:", err);
+  } finally {
+    await restoreInjectedUi(page);
+    await page.setViewportSize(originalVp).catch(() => undefined);
+    if (baseline) {
+      await page.evaluate(({ x, y }) => window.scrollTo(x, y), baseline.scroll).catch(() => undefined);
+    }
+    await naturallyCloseTransientUi(page);
   }
 
   return issues;
