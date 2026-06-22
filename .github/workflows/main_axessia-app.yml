@@ -61,13 +61,13 @@ jobs:
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/playwright-browsers
         run: |
-        node -e "
-        const fs = require('fs');
-        const { chromium } = require('playwright');
-        const executable = chromium.executablePath();
-        console.log('Chromium executable:', executable);
-        if (!fs.existsSync(executable)) process.exit(1);
-        "
+          node -e "
+          const fs = require('fs');
+          const { chromium } = require('playwright');
+          const executable = chromium.executablePath();
+          console.log('Chromium executable:', executable);
+          if (!fs.existsSync(executable)) process.exit(1);
+          "
 
       - name: Compile backend TypeScript
         working-directory: backend
