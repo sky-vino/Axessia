@@ -49,7 +49,25 @@ jobs:
       # ────────────────────────────────────────────────────────────────
       - name: Install backend dependencies
         working-directory: backend
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
+      - name: Install Playwright Chromium
+        working-directory: backend
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/playwright-browsers
+        run: npx playwright install chromium
+
+      - name: Verify Playwright Chromium
+        working-directory: backend
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/playwright-browsers
+        run: |
+        node -e "
+        const fs = require('fs');
+        const { chromium } = require('playwright');
+        const executable = chromium.executablePath();
+        console.log('Chromium executable:', executable);
+        if (!fs.existsSync(executable)) process.exit(1);
+        "
 
       - name: Compile backend TypeScript
         working-directory: backend
@@ -142,6 +160,7 @@ jobs:
             backend/migrations
             backend/package.json
             frontend/dist
+            playwright-browsers
             startup.sh
             package.json
             .deploy-sha
