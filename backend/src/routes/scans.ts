@@ -93,18 +93,7 @@ const createScanSchema = z.object({
       return Boolean(item.selector || item.text || item.cta_text || item.href_contains);
     }, {
       message: "Provide a single target selector/text/href or at least one valid journey step"
-    })).optional().default([]),
-    test_procedure_steps: z.array(z.string().trim().min(1)).max(80).optional().default([]),
-    excel_procedure_steps: z.array(z.object({
-      stepNumber: z.number().optional(),
-      expected: z.string().trim().optional().default(""),
-      actual: z.string().trim().optional().default(""),
-      action: z.enum(["navigate-url", "navigation-path", "click", "scan", "manual"]).optional().default("manual"),
-      url: z.string().trim().optional(),
-      path: z.array(z.string().trim().min(1)).optional().default([]),
-      targetText: z.string().trim().optional(),
-      scanAfterStep: z.boolean().optional().default(true)
-    })).max(120).optional().default([])
+    })).optional().default([])
   }).optional().default({})
 });
 

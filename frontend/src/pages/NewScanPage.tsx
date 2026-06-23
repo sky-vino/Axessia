@@ -41,19 +41,6 @@ type TargetInteraction = {
   steps: TargetJourneyStep[];
 };
 
-type ExcelProcedureAction = "navigate-url" | "navigation-path" | "click" | "scan" | "manual";
-
-type ExcelProcedureStep = {
-  stepNumber: number;
-  expected: string;
-  actual: string;
-  action: ExcelProcedureAction;
-  url?: string;
-  path?: string[];
-  targetText?: string;
-  scanAfterStep: boolean;
-};
-
 function scanCreateErrorMessage(error: any) {
   const data = error?.response?.data;
   const fieldErrors = data?.details?.fieldErrors;
@@ -81,115 +68,12 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: 
   );
 }
 
-function normalizeHeader(value: unknown) {
-  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-}
-
-function firstUrl(value: string) {
-  return String(value || "").match(/https?:\/\/[^\s)]+/i)?.[0]?.replace(/[.,;]+$/, "");
-}
-
-function inferExcelProcedureAction(stepNumber: number, expected: string, actual: string): ExcelProcedureStep {
-  const text = `${expected}\n${actual}`.trim();
-  const lower = text.toLowerCase();
-  const url = firstUrl(text);
-  const navigationMatch = text.match(/navigation\s*:?\s*(.+)$/im);
-  const arrowPath = navigationMatch?.[1] || (text.includes(">") ? text : "");
-  const path = arrowPath
-    ? arrowPath.split(">").map(part => part.replace(/^\s*\d+[\).:-]?\s*/, "").trim()).filter(Boolean)
-    : [];
-
-  if (url && /(precondition|navigate|url|open|launch|go to|using below)/i.test(text)) {
-    return { stepNumber, expected, actual, action: "navigate-url", url, scanAfterStep: true };
-  }
-  if (path.length >= 2) {
-    return { stepNumber, expected, actual, action: "navigation-path", path, scanAfterStep: true };
-  }
-  const clickMatch = text.match(/\b(?:click|select|choose|tap|open)\s+(?:on\s+)?["']?([^"'\n.]+)["']?/i);
-  if (clickMatch?.[1]) {
-    return { stepNumber, expected, actual, action: "click", targetText: clickMatch[1].trim(), scanAfterStep: true };
-  }
-  if (/(keyboard|tab|shift\+?tab|focus|screen reader|accessible name|contrast|reflow|zoom|visible focus|verify|scan)/i.test(lower)) {
-    return { stepNumber, expected, actual, action: "scan", scanAfterStep: true };
-  }
-  return { stepNumber, expected, actual, action: "manual", scanAfterStep: false };
-}
-
-function parseExcelProcedureRows(rows: any[][]): ExcelProcedureStep[] {
-  const nonEmptyRows = rows.filter(row => row.some(cell => String(cell ?? "").trim()));
-  if (!nonEmptyRows.length) return [];
-
-  const headerIndex = nonEmptyRows.findIndex(row =>
-    row.some(cell => /step/i.test(String(cell || ""))) &&
-    row.some(cell => /expected|procedure|description|action/i.test(String(cell || "")))
-  );
-  const header = headerIndex >= 0 ? nonEmptyRows[headerIndex] : [];
-  const body = headerIndex >= 0 ? nonEmptyRows.slice(headerIndex + 1) : nonEmptyRows;
-  const headers = header.map(normalizeHeader);
-  const findColumn = (names: string[], fallback: number) => {
-    const index = headers.findIndex(h => names.some(name => h.includes(name)));
-    return index >= 0 ? index : fallback;
-  };
-
-  const stepCol = findColumn(["step", "slno", "sno"], 0);
-  const expectedCol = findColumn(["expected", "procedure", "description", "steps", "action"], 1);
-  const actualCol = findColumn(["actual", "data", "credential", "input"], 2);
-
-  return body.map((row, index) => {
-    const rawStep = String(row[stepCol] ?? "").trim();
-    const stepNumber = Number(rawStep.replace(/[^\d.]/g, "")) || index + 1;
-    const expected = String(row[expectedCol] ?? row.find((cell, i) => i !== stepCol && String(cell ?? "").trim()) ?? "").trim();
-    const actual = String(row[actualCol] ?? "").trim();
-    return inferExcelProcedureAction(stepNumber, expected, actual);
-  }).filter(row => row.expected || row.actual).slice(0, 120);
-}
-
-function parseProcedureText(text: string): ExcelProcedureStep[] {
-  const normalized = String(text || "")
-    .replace(/\r/g, "\n")
-    .replace(/[ \t]+/g, " ")
-    .trim();
-  if (!normalized) return [];
-
-  const lines = normalized
-    .split(/\n+/)
-    .map(line => line.trim())
-    .filter(Boolean);
-  const rows: { step: number; text: string }[] = [];
-  let current: { step: number; text: string } | null = null;
-
-  for (const line of lines) {
-    const stepMatch = line.match(/^\s*(?:step\s*)?(\d{1,3})[\).:\-\s]+(.+)$/i);
-    if (stepMatch) {
-      if (current) rows.push(current);
-      current = { step: Number(stepMatch[1]), text: stepMatch[2].trim() };
-      continue;
-    }
-    if (/^(expected|actual|step)\b/i.test(line)) continue;
-    if (current) {
-      current.text = `${current.text} ${line}`.trim();
-    } else {
-      rows.push({ step: rows.length + 1, text: line });
-    }
-  }
-  if (current) rows.push(current);
-
-  return rows
-    .map((row, index) => inferExcelProcedureAction(row.step || index + 1, row.text, ""))
-    .filter(row => row.expected || row.actual)
-    .slice(0, 120);
-}
-
 export default function NewScanPage() {
   const navigate = useNavigate();
   const [urls, setUrls] = useState([""]);
   const [name, setName] = useState("");
   const [stateLabel, setStateLabel] = useState("default");
   const [showAuth, setShowAuth] = useState(false);
-  const [testProcedureText, setTestProcedureText] = useState("");
-  const [excelProcedureSteps, setExcelProcedureSteps] = useState<ExcelProcedureStep[]>([]);
-  const [excelProcedureName, setExcelProcedureName] = useState("");
-  const [excelProcedureError, setExcelProcedureError] = useState("");
   const [auth, setAuth] = useState({
     login_url: "",
     username_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-email')\n//input[@id='sky-login-email']\n#sky-login-email",
@@ -241,58 +125,6 @@ export default function NewScanPage() {
   const addUrl = () => setUrls([...urls, ""]);
   const removeUrl = (i: number) => setUrls(urls.filter((_, j) => j !== i));
   const setUrl = (i: number, v: string) => { const u = [...urls]; u[i] = v; setUrls(u); };
-  const procedureUrl = excelProcedureSteps.map(row => row.url).find(Boolean) || "";
-  const hasProcedureNavigation = Boolean(procedureUrl);
-
-  const handleExcelProcedureUpload = async (file?: File) => {
-    setExcelProcedureError("");
-    setExcelProcedureName(file?.name || "");
-    if (!file) {
-      setExcelProcedureSteps([]);
-      return;
-    }
-    try {
-      let parsed: ExcelProcedureStep[] = [];
-      if (file.type.startsWith("image/")) {
-        const { createWorker } = await import("tesseract.js");
-        const worker = await createWorker("eng");
-        try {
-          const result = await worker.recognize(file);
-          parsed = parseProcedureText(result.data.text);
-        } finally {
-          await worker.terminate();
-        }
-      } else if (/\.csv$/i.test(file.name)) {
-        const text = await file.text();
-        const rows = text.split(/\r?\n/).map(line => line.split(",").map(cell => cell.trim()));
-        parsed = parseExcelProcedureRows(rows);
-      } else {
-        const readXlsxFile = (await import("read-excel-file/browser")).default;
-        const workbookRows = await (readXlsxFile as any)(file);
-        const rows = workbookRows.map((row: any[]) => row.map((cell: any) => cell == null ? "" : String(cell)));
-        parsed = parseExcelProcedureRows(rows);
-      }
-      setExcelProcedureSteps(parsed);
-      if (!parsed.length) {
-        setExcelProcedureError("No usable test steps were found in the first worksheet.");
-      }
-      const discoveredUrl = parsed.map(row => row.url).find(Boolean);
-      if (discoveredUrl && urls.every(url => url.trim() !== discoveredUrl)) {
-        const nextUrls = urls.length === 1 && !urls[0].trim() ? [discoveredUrl] : [...urls, discoveredUrl];
-        setUrls(nextUrls.slice(0, 20));
-      }
-      const procedureLines = parsed
-        .map(row => row.expected)
-        .filter(Boolean)
-        .slice(0, 80)
-        .join("\n");
-      if (procedureLines && !testProcedureText.trim()) setTestProcedureText(procedureLines);
-    } catch (err: any) {
-      setExcelProcedureSteps([]);
-      setExcelProcedureError(err?.message || "Could not read the uploaded Excel file.");
-    }
-  };
-
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const journeyTargets = targetInteractions
@@ -323,16 +155,10 @@ export default function NewScanPage() {
       }))
       .filter(target => target.base_page && (target.mode === "journey" ? target.steps.length > 0 : (target.selector || target.text || target.cta_text || target.href_contains)));
     const validUrls = journeyOnlyMode ? [JOURNEY_START_URL] : urls.map(u => u.trim()).filter(Boolean);
-    if (!journeyOnlyMode && !validUrls.length && procedureUrl) validUrls.push(procedureUrl);
     if (!journeyOnlyMode && !validUrls.length) return;
     if (journeyOnlyMode && !journeyTargets.length) return;
     const splitPatterns = (s: string) =>
       s.split(/[\n,]+/).map(x => x.trim()).filter(Boolean).slice(0, 30);
-    const procedureSteps = testProcedureText
-      .split(/\r?\n/)
-      .map(line => line.replace(/^\s*\d+\s+/, "").replace(/^\s*\d+[\).:-]?\s*/, "").trim())
-      .filter(Boolean)
-      .slice(0, 80);
     const authPayload = {
       ...auth,
       login_url: auth.login_url.trim(),
@@ -361,8 +187,6 @@ export default function NewScanPage() {
         crawl_exclude_patterns: splitPatterns(crawlExcludeText),
         controlled_interaction_allowlist: splitPatterns(controlledAllowlistText),
         post_login_pages: journeyOnlyMode ? [] : selectedPostLoginPages,
-        test_procedure_steps: procedureSteps,
-        excel_procedure_steps: journeyOnlyMode ? [] : excelProcedureSteps,
         target_interactions: journeyOnlyMode ? journeyTargets : [],
       }
     });
@@ -455,91 +279,14 @@ export default function NewScanPage() {
                 onFocus={e => (e.target as any).style.borderColor = "rgba(15,118,110,0.4)"}
                 onBlur={e => (e.target as any).style.borderColor = "rgba(255,255,255,0.08)"} />
             </div>
-            <div>
-              <label className="block text-xs text-slate-500 mb-1.5">Test procedure steps (optional)</label>
-              <textarea
-                rows={6}
-                style={{ ...inputStyle, minHeight: 128, resize: "vertical" }}
-                placeholder={"Paste business test steps here, one per line. The scanner will map each step to automated, hybrid, or manual coverage and show it as a compact expandable test case.\nExample: Verify visible focus indicator is present for all focused elements."}
-                value={testProcedureText}
-                onChange={e => setTestProcedureText(e.target.value)}
-              />
-              <p className="text-[11px] text-slate-600 mt-1.5 leading-relaxed">
-                These steps are not shown as clutter in the main result. They appear under a single expandable Test Procedure Coverage case with status, coverage type, module, and evidence.
-              </p>
-            </div>
-            <div className="rounded-lg p-4 space-y-3" style={{ background: "rgba(255,255,255,0.025)", border: "1px solid var(--border)" }}>
-              <div>
-                <label className="block text-xs text-slate-500 mb-1.5">Upload test procedure Excel (optional)</label>
-                <input
-                  type="file"
-                  accept=".xlsx,.csv,image/*"
-                  onChange={e => handleExcelProcedureUpload(e.target.files?.[0])}
-                  className="block w-full text-sm text-slate-400 file:mr-3 file:rounded-lg file:border-0 file:px-3 file:py-2 file:text-xs file:font-semibold file:text-slate-100"
-                  style={{ colorScheme: "dark" }}
-                />
-                <p className="text-[11px] text-slate-600 mt-1.5 leading-relaxed">
-                  Upload Excel/CSV or a screenshot/photo. Sheets use flexible columns such as Step, Expected, Actual, Procedure, or Action; images are OCR-read and then parsed into executable steps.
-                </p>
-              </div>
-              {excelProcedureError && (
-                <div className="text-xs text-red-400 rounded-lg px-3 py-2" style={{ background: "rgba(255,77,109,0.1)", border: "1px solid rgba(255,77,109,0.2)" }}>
-                  {excelProcedureError}
-                </div>
-              )}
-              {excelProcedureSteps.length > 0 && (
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="text-xs text-slate-400">
-                      Parsed {excelProcedureSteps.length} step{excelProcedureSteps.length === 1 ? "" : "s"} from {excelProcedureName || "Excel"}.
-                    </p>
-                    <button type="button" onClick={() => { setExcelProcedureSteps([]); setExcelProcedureName(""); setExcelProcedureError(""); }}
-                      className="text-xs text-slate-500 hover:text-red-400">
-                      Clear
-                    </button>
-                  </div>
-                  <div className="max-h-48 overflow-auto rounded-lg border" style={{ borderColor: "var(--border)" }}>
-                    <table className="w-full text-left text-xs">
-                      <thead className="sticky top-0" style={{ background: "var(--card)" }}>
-                        <tr className="text-slate-500">
-                          <th className="px-3 py-2 font-semibold">Step</th>
-                          <th className="px-3 py-2 font-semibold">Action</th>
-                          <th className="px-3 py-2 font-semibold">Target</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {excelProcedureSteps.slice(0, 20).map(row => (
-                          <tr key={`${row.stepNumber}-${row.expected}`} className="border-t" style={{ borderColor: "var(--border)" }}>
-                            <td className="px-3 py-2 text-slate-400">{row.stepNumber}</td>
-                            <td className="px-3 py-2 text-slate-300">{row.action}</td>
-                            <td className="px-3 py-2 text-slate-500">
-                              {row.url || row.path?.join(" > ") || row.targetText || row.expected}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              )}
-            </div>
           </div>
         </motion.div>
 
         {/* Scan entry */}
         <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.05 }} className="card p-6">
           <h2 className="text-sm font-semibold text-slate-300 mb-2">
-            Scan entry {!hasProcedureNavigation && <span className="text-accent text-xs ml-1">*</span>}
+            Scan entry <span className="text-accent text-xs ml-1">*</span>
           </h2>
-          {!journeyOnlyMode && hasProcedureNavigation ? (
-            <div className="mb-4 rounded-lg px-3 py-2 text-xs text-slate-400" style={{ background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.2)" }}>
-              Using procedure URL from upload: <span className="text-slate-200 break-all">{procedureUrl}</span>
-            </div>
-          ) : !journeyOnlyMode ? (
-            <p className="text-xs text-slate-600 mb-4 leading-relaxed">
-              Temporarily optional when the uploaded Excel/photo contains a URL. Otherwise provide a target URL here.
-            </p>
-          ) : null}
           <div className="mb-4 grid gap-2" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }}>
             <button
               type="button"
@@ -548,7 +295,7 @@ export default function NewScanPage() {
               style={{ background: opts.scan_entry_mode === "url" ? "rgba(15,118,110,0.08)" : "rgba(255,255,255,0.025)", borderColor: opts.scan_entry_mode === "url" ? "rgba(15,118,110,0.45)" : "var(--border)" }}
             >
               <div className="text-sm font-semibold">Scan target URL</div>
-              <div className="text-[11px] text-slate-600 mt-1">Use each URL or procedure URL as a page to scan.</div>
+              <div className="text-[11px] text-slate-600 mt-1">Use each URL as a page to scan.</div>
             </button>
             <button
               type="button"
@@ -562,14 +309,14 @@ export default function NewScanPage() {
           </div>
           {journeyOnlyMode && (
             <div className="mb-4 rounded-lg px-3 py-2 text-xs text-slate-400" style={{ background: "rgba(15,118,110,0.08)", border: "1px solid rgba(15,118,110,0.25)" }}>
-              Journey mapping mode disables target URL entry and uploaded-procedure page navigation. The scanner uses an internal authenticated start page only for login/navigation, then scans the configured target journey.
+              Journey mapping mode disables target URL entry. The scanner uses an internal authenticated start page only for login/navigation, then scans the configured target journey.
             </div>
           )}
           {!journeyOnlyMode && (
             <div className="space-y-2">
               {urls.map((url, i) => (
                 <div key={i} className="flex gap-2">
-                  <input type="url" style={inputStyle} required={!hasProcedureNavigation} placeholder={hasProcedureNavigation ? "Optional override URL" : `https://example.com${i > 0 ? "/page-" + (i + 1) : ""}`}
+                  <input type="url" style={inputStyle} required placeholder={`https://example.com${i > 0 ? "/page-" + (i + 1) : ""}`}
                     value={url} onChange={e => setUrl(i, e.target.value)}
                     onFocus={e => (e.target as any).style.borderColor = "rgba(15,118,110,0.4)"}
                     onBlur={e => (e.target as any).style.borderColor = "rgba(255,255,255,0.08)"} />
