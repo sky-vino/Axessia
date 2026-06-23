@@ -27,7 +27,7 @@
     "morgan": "^1.10.0",
     "openai": "^4.103.0",
     "pdf-lib": "^1.17.1",
-    "playwright": "^1.50.0",
+    "playwright": "1.61.0",
     "sqlite": "^5.1.1",
     "sqlite3": "^5.1.7",
     "uuid": "^11.1.0",
