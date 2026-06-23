@@ -16,7 +16,7 @@
  */
 
 import { chromium } from "playwright";
-import type { ScanOptions, ProgressCallback, ScanIssue, DomSnapshot, TestCase, StateConfig, TargetInteractionConfig, TargetJourneyStep, TestProcedureStepCoverage, ExcelProcedureStep, ControlledInteractionReportItem } from "./types";
+import type { ScanOptions, ProgressCallback, ScanIssue, DomSnapshot, TestCase, StateConfig, TargetInteractionConfig, TargetJourneyStep, ControlledInteractionReportItem } from "./types";
 import { navigateSafely } from "./navigation";
 import { runAxe } from "./axeScan";
 import { runHeuristics } from "./heuristics";
@@ -173,7 +173,6 @@ export class AccessibilityScanner {
               }
 
               if (!journeyOnlyMode) {
-                await this.scanExcelProcedureSteps(page, profileUrl || landedUrl || url, opts, extraStates, progress, scannedEntrypoints, authConfig);
                 await this.scanConfiguredPostLoginPages(page, profileUrl || landedUrl || url, opts, extraStates, progress, scannedEntrypoints, authConfig);
               }
               await this.scanTargetedInteractions(page, profileUrl || landedUrl || url, opts, extraStates, progress, scannedEntrypoints, authConfig);
@@ -199,7 +198,6 @@ export class AccessibilityScanner {
               }
               await page.waitForTimeout(1200);
               await this.runFullPageScan(page, url, opts, extraStates, progress);
-              await this.scanExcelProcedureSteps(page, url, opts, extraStates, progress, this.scannedPageKeys, null);
               if (opts.crawl_mode) {
                 await this.scanLinkedPageStates(page, url, opts, extraStates, progress);
               }
@@ -220,7 +218,6 @@ export class AccessibilityScanner {
     this.allIssues = this.prioritizeIssues(this.calibrateIssues(this.deduplicateIssues(this.allIssues)));
     this.generateTestCases();
     this.generateManualHybridReviewCases();
-    this.generateTestProcedureCoverage(opts);
     const score = this.computeScore(this.allIssues);
     logger.info(`Scan navigation trail (${this.navigatedUrls.length} URL${this.navigatedUrls.length === 1 ? "" : "s"}): ${this.navigatedUrls.join(" -> ") || "none recorded"}`);
     logger.info(`Scan complete: ${this.allIssues.length} issues, score ${score}`);
@@ -3482,214 +3479,6 @@ export class AccessibilityScanner {
 
       this.testCases.push(...reviews);
   }
-
-  private generateTestProcedureCoverage(opts: ScanOptions): void {
-    const rawSteps = (Array.isArray(opts.test_procedure_steps) ? opts.test_procedure_steps : [])
-      .map(step => String(step || "").replace(/^\s*\d+[\).:-]?\s*/, "").trim())
-      .filter(Boolean)
-      .slice(0, 80);
-    if (!rawSteps.length) return;
-
-    const coverageSteps: TestProcedureStepCoverage[] = rawSteps.map((step, index) => {
-      const mapped = this.mapProcedureStep(step);
-      return {
-        stepNumber: index + 1,
-        stepText: step,
-        coverageType: mapped.coverageType,
-        scannerModule: mapped.scannerModule,
-        status: mapped.status,
-        evidence: mapped.evidence,
-      };
-    });
-
-    const totals = coverageSteps.reduce((acc: Record<string, number>, step) => {
-      acc[step.coverageType] = (acc[step.coverageType] || 0) + 1;
-      acc[step.status] = (acc[step.status] || 0) + 1;
-      return acc;
-    }, {});
-
-    const hasFailures = coverageSteps.some(step => step.status === "fail");
-    const allAutomatedPassed = coverageSteps
-      .filter(step => step.coverageType === "automated")
-      .every(step => step.status === "pass");
-
-    this.testCases.unshift({
-      name: "Test Procedure Coverage",
-      description: `Mapped ${coverageSteps.length} provided business test step${coverageSteps.length === 1 ? "" : "s"} to scanner coverage. Automated: ${totals.automated || 0}, hybrid: ${totals.hybrid || 0}, manual: ${totals.manual || 0}.`,
-      category: "hybrid-review",
-      wcagRef: "Procedure coverage",
-      status: hasFailures ? "fail" : allAutomatedPassed && !(totals.hybrid || totals.manual) ? "pass" : "pending",
-      steps: coverageSteps,
-      result: `Coverage summary: ${(totals.pass || 0)} passed, ${(totals.fail || 0)} failed, ${(totals.pending || 0)} need review. Expand this case to review step-level coverage.`,
-    });
-  }
-
-  private async scanExcelProcedureSteps(
-    page: any,
-    baseUrl: string,
-    opts: ScanOptions,
-    extraStates: StateConfig[],
-    progress: (msg: string) => void,
-    scannedKeys: Set<string>,
-    authConfig: any
-  ): Promise<void> {
-    const rows = this.normalizedExcelProcedureSteps(opts);
-    if (!rows.length) return;
-
-    const executed: string[] = [];
-    let scannedCount = 0;
-    let blockedCount = 0;
-
-    progress(`Executing uploaded Excel procedure with ${rows.length} step${rows.length === 1 ? "" : "s"}`);
-
-    for (const row of rows) {
-      const label = this.excelStepLabel(row);
-      try {
-        if (row.action === "navigate-url" && row.url) {
-          progress(`Excel step ${row.stepNumber}: navigate to ${row.url}`);
-          const ok = await this.navigateAndRecord(page, row.url, `excel procedure step ${row.stepNumber}`);
-          if (!ok) throw new Error(`URL is unreachable: ${row.url}`);
-          await this.waitAfterTargetStep(page, authConfig, progress, label);
-          executed.push(`Step ${row.stepNumber}: navigated to ${row.url}.`);
-        } else if (row.action === "navigation-path" && row.path?.length) {
-          progress(`Excel step ${row.stepNumber}: follow navigation path ${row.path.join(" > ")}`);
-          for (const pathPart of row.path) {
-            const part = String(pathPart || "").trim();
-            if (!part || /^(accesso|login|home)$/i.test(part)) continue;
-            const clicked = await this.clickByVisibleText(page, part);
-            if (!clicked) throw new Error(`Navigation item not found: ${part}`);
-            await this.waitAfterTargetStep(page, authConfig, progress, part);
-          }
-          executed.push(`Step ${row.stepNumber}: followed navigation path ${row.path.join(" > ")}.`);
-        } else if (row.action === "click" && row.targetText) {
-          progress(`Excel step ${row.stepNumber}: click ${row.targetText}`);
-          const clicked = await this.clickByVisibleText(page, row.targetText);
-          if (!clicked) {
-            await this.prepareTargetLaunchPage(page, label, progress);
-            const retry = await this.clickTargetInteraction(page, {
-              base_page: baseUrl,
-              name: row.targetText,
-              text: row.targetText,
-              click_type: "any",
-            });
-            if (!retry) throw new Error(`Click target not found: ${row.targetText}`);
-          }
-          await this.waitAfterTargetStep(page, authConfig, progress, row.targetText);
-          executed.push(`Step ${row.stepNumber}: clicked ${row.targetText}.`);
-        } else if (row.action === "scan") {
-          progress(`Excel step ${row.stepNumber}: scan current procedure state`);
-          executed.push(`Step ${row.stepNumber}: scanned current page/state.`);
-        } else {
-          executed.push(`Step ${row.stepNumber}: kept for manual review.`);
-          continue;
-        }
-
-        if (row.scanAfterStep !== false || row.action === "scan") {
-          const currentUrl = this.currentTargetUrl(page, baseUrl, `excel-step-${row.stepNumber}`);
-          const scanned = await this.scanTargetDestinationOnce(page, currentUrl, opts, extraStates, progress, scannedKeys, `excel-procedure:${row.stepNumber}`);
-          if (scanned) scannedCount++;
-          scannedCount += await this.scanDiscoveredSidebarDestinations(page, currentUrl, opts, extraStates, progress, scannedKeys, `excel-step-${row.stepNumber}`, authConfig);
-        }
-      } catch (err) {
-        blockedCount++;
-        const message = (err as Error)?.message || String(err);
-        progress(`WARN: Excel step ${row.stepNumber} could not be executed: ${message}`);
-        executed.push(`Step ${row.stepNumber}: blocked - ${message}.`);
-        logger.warn(`Excel procedure step ${row.stepNumber} failed:`, err);
-      }
-    }
-
-    this.testCases.push({
-      name: "Excel procedure journey scan",
-      description: "The scanner executed navigable rows from the uploaded Excel procedure and scanned the reached pages/states.",
-      category: "hybrid-review",
-      wcagRef: "Procedure execution",
-      status: blockedCount ? "pending" : scannedCount > 0 ? "pass" : "pending",
-      issueUrl: page.url(),
-      steps: executed,
-      result: `Excel procedure execution completed; ${scannedCount} page/state scan${scannedCount === 1 ? "" : "s"} captured, ${blockedCount} step${blockedCount === 1 ? "" : "s"} need review.`
-    });
-  }
-
-  private normalizedExcelProcedureSteps(opts: ScanOptions): ExcelProcedureStep[] {
-    return (Array.isArray(opts.excel_procedure_steps) ? opts.excel_procedure_steps : [])
-      .map((row, index) => ({
-        stepNumber: Number(row.stepNumber) || index + 1,
-        expected: String(row.expected || "").trim(),
-        actual: String(row.actual || "").trim(),
-        action: row.action || "manual",
-        url: String(row.url || "").trim() || undefined,
-        path: Array.isArray(row.path) ? row.path.map(part => String(part || "").trim()).filter(Boolean) : [],
-        targetText: String(row.targetText || "").trim() || undefined,
-        scanAfterStep: row.scanAfterStep !== false,
-      }))
-      .filter(row => row.expected || row.actual || row.url || row.path.length || row.targetText)
-      .slice(0, 120);
-  }
-
-  private excelStepLabel(row: ExcelProcedureStep): string {
-    return row.targetText || row.path?.join(" > ") || row.url || row.expected || `Excel step ${row.stepNumber}`;
-  }
-
-  private mapProcedureStep(step: string): Pick<TestProcedureStepCoverage, "coverageType" | "scannerModule" | "status" | "evidence"> {
-    const text = step.toLowerCase();
-    const issueText = this.allIssues.map(issue => `${issue.ruleId} ${issue.category || ""} ${issue.message}`).join(" ").toLowerCase();
-    const hasIssue = (pattern: RegExp) => pattern.test(issueText);
-    const moduleEnabled = (label: string) => `${label} module executed during this scan.`;
-
-    if (/credential|login|otp|precondition|navigate to .*url|enter credentials/.test(text)) {
-      return { coverageType: "automated", scannerModule: "Authentication workflow", status: "pass", evidence: "The scanner completed configured navigation/login before protected page scans." };
-    }
-    if (/navigate.*(menu|app|accesso|impostazioni|dispositivi|gestisci)|click|button|link|promo|card/.test(text)) {
-      return { coverageType: "hybrid", scannerModule: "Configured page navigation / targeted interactions", status: "pending", evidence: "Navigation can be automated when represented by selected pages or targeted interaction configuration; confirm business-path correctness." };
-    }
-    if (/keyboard only|tab|shift\+?tab|focus order|logical focus/.test(text)) {
-      const failed = hasIssue(/keyboard|focus:trap|tab-order/);
-      return { coverageType: "automated", scannerModule: "Keyboard navigation", status: failed ? "fail" : "pass", evidence: failed ? "Keyboard/focus issues were detected and linked in the Issues tab." : moduleEnabled("Keyboard navigation") };
-    }
-    if (/visible focus|focus indicator|focused elements/.test(text)) {
-      const failed = hasIssue(/focus:invisible|focus indicator|color:focus/);
-      return { coverageType: "automated", scannerModule: "Focus visibility", status: failed ? "fail" : "pass", evidence: failed ? "Focus visibility issues were detected." : moduleEnabled("Focus visibility") };
-    }
-    if (/focus.*trap|trapped|move away|escape/.test(text)) {
-      const failed = hasIssue(/focus:trap|escape-key|keyboard/);
-      return { coverageType: "automated", scannerModule: "Focus trap checks", status: failed ? "fail" : "pass", evidence: failed ? "Potential focus trap or escape-key issues were detected." : moduleEnabled("Focus trap") };
-    }
-    if (/screen reader|announced|assistive technolog|accessible name|names?[, ]+roles?/.test(text)) {
-      const failed = hasIssue(/aria|label|role|name|status-message/);
-      return { coverageType: "hybrid", scannerModule: "axe-core, accessibility tree, ARIA/name checks", status: failed ? "fail" : "pending", evidence: failed ? "Programmatic name/role/state issues were detected; real screen reader confirmation is still required." : "Automation collected accessibility tree evidence; real screen reader announcement quality remains a hybrid/manual confirmation." };
-    }
-    if (/heading|label|relationship|structure|programmatic/.test(text)) {
-      const failed = hasIssue(/heading|label|landmark|aria|required-children|structure/);
-      return { coverageType: "hybrid", scannerModule: "Structure, landmarks, labels, ARIA checks", status: failed ? "fail" : "pending", evidence: failed ? "Structural or labeling issues were detected." : "Automated DOM/ARIA checks ran; semantic correctness should be reviewed in context." };
-    }
-    if (/contrast|minimum color|text.*icons/.test(text)) {
-      const failed = hasIssue(/contrast|color/);
-      return { coverageType: "automated", scannerModule: "Color contrast", status: failed ? "fail" : "pass", evidence: failed ? "Contrast issues were detected." : moduleEnabled("Color contrast") };
-    }
-    if (/color alone|conveyed by color/.test(text)) {
-      return { coverageType: "hybrid", scannerModule: "Color and visual heuristic review", status: "pending", evidence: "Automation can detect some color/contrast risks, but meaning conveyed by color alone requires visual review." };
-    }
-    if (/form field|error message|required|error/.test(text)) {
-      const failed = hasIssue(/input|label|error|form|status-message/);
-      return { coverageType: "hybrid", scannerModule: "Form label and error heuristics", status: failed ? "fail" : "pending", evidence: failed ? "Form/error issues were detected." : "Form heuristics ran; confirm submitted error states in the business flow." };
-    }
-    if (/status message|alert|dynamically updated|updated content/.test(text)) {
-      const failed = hasIssue(/status-message|aria-live|alert/);
-      return { coverageType: "hybrid", scannerModule: "Status message heuristics", status: failed ? "fail" : "pending", evidence: failed ? "Status announcement risks were detected." : "Automation checked common live-region patterns; screen reader confirmation remains recommended." };
-    }
-    if (/text scaling|reflow|200%|400%|zoom|mobile|display zoom|font scaling/.test(text)) {
-      const failed = hasIssue(/reflow|viewport|zoom|target-size|truncation/);
-      return { coverageType: "automated", scannerModule: "Zoom, reflow, viewport and pointer checks", status: failed ? "fail" : "pass", evidence: failed ? "Zoom/reflow/touch risks were detected." : moduleEnabled("Zoom/reflow") };
-    }
-    if (/title|screen name|page title/.test(text)) {
-      const failed = hasIssue(/title|document-title|page-has-heading-one|h1|heading/);
-      return { coverageType: "automated", scannerModule: "Document title and heading heuristics", status: failed ? "fail" : "pass", evidence: failed ? "Page title or heading risks were detected." : "Document title and heading heuristics completed." };
-    }
-
-    return { coverageType: "manual", scannerModule: "Manual review", status: "pending", evidence: "No reliable automated mapping exists for this step; keep it as a tester confirmation item." };
-  }
-
   private computeScore(issues: ScanIssue[]): number {
     if (!issues.length) return 100;
     const weights: Record<string, number> = { critical: 14, serious: 8, moderate: 3.5, minor: 1 };
