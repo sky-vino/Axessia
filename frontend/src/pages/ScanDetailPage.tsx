@@ -5,7 +5,7 @@ import { scanApi, reportApi, issueApi } from "../services/api";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   ArrowLeft, LayoutDashboard, AlertTriangle, Code2,
-  FlaskConical, Eye, Loader2, RefreshCw,
+  FlaskConical, Loader2, RefreshCw, Download,
   Layers, FileText, RotateCcw, ListChecks, ShieldCheck, Volume2
 } from "lucide-react";
 
@@ -13,7 +13,6 @@ import SummaryTab        from "../components/tabs/SummaryTab";
 import IssuesTab         from "../components/tabs/IssuesTab";
 import FixesTab          from "../components/tabs/FixesTab";
 import TestCasesTab      from "../components/tabs/TestCasesTab";
-import LiveDomTab        from "../components/tabs/LiveDomTab";
 import StatesTab         from "../components/tabs/StatesTab";
 import WcagTab           from "../components/tabs/WcagTab";
 import ScreenReaderTab   from "../components/tabs/ScreenReaderTab";
@@ -26,7 +25,6 @@ const TABS = [
   { id: "fixes",        label: "AI Fixes",      icon: Code2 },
   { id: "states",       label: "UI States",     icon: Layers },
   { id: "testcases",    label: "Test Cases",    icon: FlaskConical },
-  { id: "livedom",      label: "Live DOM",      icon: Eye },
 ];
 
 const STATUS_COLORS: Record<string, string> = {
@@ -136,11 +134,35 @@ export default function ScanDetailPage() {
           <head><title>Report unavailable</title></head>
           <body style="font-family: Arial, sans-serif; padding: 24px; color: #1f2937;">
             <h2>Report could not be opened</h2>
-            <p>Your session may have expired. Please sign in again and try the PDF Report button once more.</p>
+            <p>Your session may have expired. Please sign in again and try the report button once more.</p>
           </body>
         </html>
       `);
       win.document.close();
+    } finally {
+      setDownloading(null);
+      setReportMenuOpen(false);
+    }
+  };
+
+  const handleDownloadPdf = async () => {
+    if (!id || downloading === "pdf") return;
+    const sections = reportSections.length ? reportSections : REPORT_SECTION_OPTIONS.map(option => option.id);
+    setDownloading("pdf");
+    try {
+      const response = await reportApi.getPdf(id, sections);
+      const disposition = String(response.headers?.["content-disposition"] || "");
+      const fileNameMatch = disposition.match(/filename="?([^";]+)"?/i);
+      const fileName = fileNameMatch?.[1] || `accessibility-report-${id}.pdf`;
+      const blob = new Blob([response.data], { type: "application/pdf" });
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
     } finally {
       setDownloading(null);
       setReportMenuOpen(false);
@@ -245,6 +267,18 @@ export default function ScanDetailPage() {
               </button>
             )}
             {isComplete && (
+              <button
+                onClick={handleDownloadPdf}
+                disabled={downloading === "pdf"}
+                className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg border transition-all hover:bg-white/[0.04] disabled:opacity-60"
+                style={{ borderColor: "rgba(15,118,110,0.3)", color: "#0f766e" }}
+                title="Download the server-rendered PDF report"
+              >
+                {downloading === "pdf" ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+                Download PDF
+              </button>
+            )}
+            {isComplete && (
               <div className="relative">
                 <button
                   onClick={() => setReportMenuOpen(open => !open)}
@@ -256,7 +290,7 @@ export default function ScanDetailPage() {
                   {downloading === "report"
                     ? <Loader2 size={13} className="animate-spin" />
                     : <FileText size={13} />}
-                  PDF Report
+                  Open Report
                 </button>
                 {reportMenuOpen && (
                   <div
@@ -385,7 +419,6 @@ export default function ScanDetailPage() {
             {activeTab === "fixes"        && <FixesTab        scanId={scan.id} focusedIssueId={focusedFixIssueId} onBackToIssue={(issueId) => { setFocusedIssueId(issueId); setActiveTab("issues"); }} />}
             {activeTab === "states"       && <StatesTab       scanId={scan.id} focusedIssueId={focusedStateIssueId} preferredState={focusedStateName} onBackToIssue={(issueId) => { setFocusedIssueId(issueId); setActiveTab("issues"); }} />}
             {activeTab === "testcases"    && <TestCasesTab    scanId={scan.id} />}
-            {activeTab === "livedom"      && <LiveDomTab      scanId={scan.id} />}
           </motion.div>
         </AnimatePresence>
       </div>

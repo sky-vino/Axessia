@@ -1,4 +1,4 @@
-﻿import axios from "axios";
+import axios from "axios";
 
 export const api = axios.create({
   baseURL: (import.meta as any).env?.VITE_API_URL
@@ -103,6 +103,10 @@ export const wcagGovernanceApi = {
 export const reportApi = {
   getReport: (scanId: string, sections?: string[]) => api.get(`/scans/${scanId}/report`, {
     responseType: "text",
+    params: sections?.length ? { sections: sections.join(",") } : undefined
+  }),
+  getPdf: (scanId: string, sections?: string[]) => api.get(`/scans/${scanId}/report/pdf`, {
+    responseType: "blob",
     params: sections?.length ? { sections: sections.join(",") } : undefined
   }),
   getReportUrl: (scanId: string, sections?: string[]) => {
