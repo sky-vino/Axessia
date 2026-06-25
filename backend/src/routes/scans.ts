@@ -4,7 +4,6 @@ import { db } from "../utils/db";
 import { scanQueue } from "../services/scanQueue";
 import { generateScanReport } from "../services/reportService";
 import { z } from "zod";
-import { chromium } from "playwright";
 
 export const scanRouter = Router();
 scanRouter.use(authenticate);
@@ -15,6 +14,7 @@ const createScanSchema = z.object({
   project_id: z.string().uuid().optional(),
   state_label: z.string().optional().default("default"),
   auth_config: z.object({
+    workflow_type: z.enum(["generic", "sky"]).optional().default("generic"),
     login_url: z.string().url(),
     username_selector: z.string().trim().min(1),
     password_selector: z.string().trim().min(1),
@@ -46,65 +46,27 @@ const createScanSchema = z.object({
     run_motion: z.boolean().optional().default(true),
     run_reflow: z.boolean().optional().default(true),
     capture_screenshots: z.boolean().optional().default(true),
+    workflow_type: z.enum(["generic", "sky"]).optional().default("generic"),
     viewport_width: z.number().optional().default(1366),
     viewport_height: z.number().optional().default(768),
     headful: z.boolean().optional().default(false),
-    scan_entry_mode: z.enum(["url", "journey"]).optional().default("url"),
     crawl_mode: z.boolean().optional().default(false),
     crawl_depth: z.number().optional().default(2),
     crawl_same_domain: z.boolean().optional().default(true),
     crawl_include_patterns: z.array(z.string()).optional().default([]),
     crawl_exclude_patterns: z.array(z.string()).optional().default([]),
     crawl_max_pages: z.number().optional().default(30),
-    scan_login_page: z.boolean().optional().default(false),
-    scan_post_login_landing: z.boolean().optional().default(false),
-    scan_gestisci_page: z.boolean().optional().default(false),
+    scan_login_page: z.boolean().optional().default(true),
+    scan_post_login_landing: z.boolean().optional().default(true),
     post_login_tab_scan: z.boolean().optional().default(true),
     post_login_tab_limit: z.number().optional().default(12),
-    post_login_pages: z.array(z.string()).optional().default([]),
-    controlled_interaction_scan: z.boolean().optional().default(false),
-    controlled_interaction_mode: z.enum(["safe-auto", "tester-selected", "exhaustive"]).optional().default("safe-auto"),
-    controlled_interaction_allowlist: z.array(z.string().trim()).optional().default([]),
-    controlled_interaction_limit: z.number().optional().default(12),
-    target_interactions: z.array(z.object({
-      base_page: z.string().trim().min(1),
-      mode: z.enum(["single-interaction", "journey"]).optional().default("single-interaction"),
-      name: z.string().trim().optional(),
-      selector: z.string().trim().optional(),
-      text: z.string().trim().optional(),
-      cta_text: z.string().trim().optional(),
-      href_contains: z.string().trim().optional(),
-      click_type: z.enum(["button", "link", "heading-link", "any"]).optional().default("any"),
-      scan_destination_only: z.boolean().optional().default(true),
-      scan_launch_page: z.boolean().optional().default(false),
-      steps: z.array(z.object({
-        action: z.enum(["navigate-page", "click"]),
-        page: z.string().trim().optional(),
-        name: z.string().trim().optional(),
-        selector: z.string().trim().optional(),
-        text: z.string().trim().optional(),
-        cta_text: z.string().trim().optional(),
-        href_contains: z.string().trim().optional(),
-        click_type: z.enum(["button", "link", "heading-link", "any"]).optional().default("any"),
-        scan_after_step: z.boolean().optional().default(false)
-      })).optional().default([])
-    }).refine(item => {
-      if (item.mode === "journey") return item.steps.some(step => step.action === "navigate-page" ? Boolean(step.page) : Boolean(step.selector || step.text || step.cta_text || step.href_contains));
-      return Boolean(item.selector || item.text || item.cta_text || item.href_contains);
-    }, {
-      message: "Provide a single target selector/text/href or at least one valid journey step"
-    })).optional().default([]),
-    test_procedure_steps: z.array(z.string().trim().min(1)).max(80).optional().default([]),
-    excel_procedure_steps: z.array(z.object({
-      stepNumber: z.number().optional(),
-      expected: z.string().trim().optional().default(""),
-      actual: z.string().trim().optional().default(""),
-      action: z.enum(["navigate-url", "navigation-path", "click", "scan", "manual"]).optional().default("manual"),
-      url: z.string().trim().optional(),
-      path: z.array(z.string().trim().min(1)).optional().default([]),
-      targetText: z.string().trim().optional(),
-      scanAfterStep: z.boolean().optional().default(true)
-    })).max(120).optional().default([])
+    post_login_pages: z.array(z.string()).optional().default([
+      "Offerte",
+      "Profilo",
+      "Impostazioni",
+      "Fatture",
+      "Scopri l'app My Sky"
+    ])
   }).optional().default({})
 });
 
@@ -303,7 +265,7 @@ scanRouter.patch("/:id/test-cases/:testCaseId", async (req: AuthRequest, res: Re
   res.json({ test_case: result.rows[0] });
 });
 
-// GET /api/scans/:id/report - interactive HTML report
+// GET /api/scans/:id/report — HTML report (open in browser → print to PDF)
 scanRouter.get("/:id/report", async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const scanId = String(req.params.id);
@@ -322,7 +284,7 @@ scanRouter.get("/:id/report", async (req: AuthRequest, res: Response): Promise<v
   }
 });
 
-// GET /api/scans/:id/screenshots - all base64 screenshots for download
+// GET /api/scans/:id/screenshots — all base64 screenshots for download
 scanRouter.get("/:id/screenshots", async (req: AuthRequest, res: Response): Promise<void> => {
   const result = await db.query(
     `SELECT id, url, phase, screenshot, created_at FROM dom_snapshots
@@ -335,47 +297,4 @@ scanRouter.get("/:id/screenshots", async (req: AuthRequest, res: Response): Prom
       screenshot: r.screenshot, created_at: r.created_at,
     }))
   });
-});
-
-// GET /api/scans/:id/report/pdf - server-rendered downloadable PDF
-scanRouter.get("/:id/report/pdf", async (req: AuthRequest, res: Response): Promise<void> => {
-  let browser: any;
-  try {
-    const scanId = String(req.params.id);
-    const sectionQuery = req.query.sections;
-    const sections = Array.isArray(sectionQuery)
-      ? sectionQuery.flatMap(section => String(section).split(","))
-      : typeof sectionQuery === "string"
-        ? sectionQuery.split(",")
-        : undefined;
-
-    const scanResult = await db.query("SELECT name FROM scans WHERE id = $1", [scanId]);
-    const scanName = String(scanResult.rows[0]?.name || `accessibility-report-${scanId}`)
-      .replace(/[^\w.-]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 80);
-
-    const html = await generateScanReport(scanId, sections);
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-    });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 1200 } });
-    await page.setContent(html, { waitUntil: "networkidle", timeout: 60000 });
-    await page.emulateMedia({ media: "print" });
-    const pdf = await page.pdf({
-      format: "A4",
-      landscape: true,
-      printBackground: true,
-      margin: { top: "12mm", right: "10mm", bottom: "12mm", left: "10mm" }
-    });
-
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="${scanName || "accessibility-report"}.pdf"`);
-    res.send(pdf);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || "PDF report generation failed" });
-  } finally {
-    if (browser) await browser.close().catch(() => undefined);
-  }
 });
