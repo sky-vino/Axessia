@@ -54,8 +54,30 @@ export interface TestCase {
   issueId?: string;
   issueRuleId?: string;
   issueUrl?: string;
-  steps?: string[];
+  steps?: Array<string | TestProcedureStepCoverage>;
   result?: string;
+}
+
+export interface TestProcedureStepCoverage {
+  stepNumber: number;
+  stepText: string;
+  coverageType: "automated" | "hybrid" | "manual";
+  scannerModule: string;
+  status: "pass" | "fail" | "pending";
+  evidence: string;
+}
+
+export type ExcelProcedureAction = "navigate-url" | "navigation-path" | "click" | "scan" | "manual";
+
+export interface ExcelProcedureStep {
+  stepNumber: number;
+  expected: string;
+  actual?: string;
+  action: ExcelProcedureAction;
+  url?: string;
+  path?: string[];
+  targetText?: string;
+  scanAfterStep?: boolean;
 }
 
 export interface StateConfig {
@@ -175,6 +197,10 @@ export interface ScanOptions {
   controlled_interaction_allowlist?: string[];
   /** Maximum discovered interactions to attempt per page. */
   controlled_interaction_limit?: number;
+  /** Optional pasted business/test procedure steps to map against scanner coverage. */
+  test_procedure_steps?: string[];
+  /** Structured steps parsed from an uploaded Excel procedure. Executable rows can drive navigation before scanning. */
+  excel_procedure_steps?: ExcelProcedureStep[];
 }
 
 export type ProgressCallback = (progress: number, message: string) => void;
