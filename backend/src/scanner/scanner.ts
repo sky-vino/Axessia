@@ -75,6 +75,7 @@ export class AccessibilityScanner {
       stepsDone++;
       this.onProgress(Math.min(Math.round((stepsDone / totalSteps) * 94) + 1, 94), msg);
     };
+
     const browser = await chromium.launch({
       headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
