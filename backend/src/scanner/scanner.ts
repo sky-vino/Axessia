@@ -224,13 +224,44 @@ export class AccessibilityScanner {
   }
 
   private async createBrowserContext(browser: any, opts: ScanOptions): Promise<any> {
-    return browser.newContext({
+    const context = await browser.newContext({
       viewport: { width: opts.viewport_width || 1366, height: opts.viewport_height || 768 },
       ignoreHTTPSErrors: true,
       locale: "en-US",
+      serviceWorkers: "block",
+      storageState: { cookies: [], origins: [] },
     });
+    await this.prepareFreshScanContext(context);
+    return context;
   }
 
+  private async prepareFreshScanContext(context: any): Promise<void> {
+    await context.clearCookies().catch((err: unknown) => logger.debug("Scan context cookie cleanup failed:", err));
+    await context.addInitScript(() => {
+      const clearClientStorage = () => {
+        try { window.localStorage?.clear(); } catch { /* storage may be blocked */ }
+        try { window.sessionStorage?.clear(); } catch { /* storage may be blocked */ }
+        try {
+          if ("caches" in window) {
+            caches.keys().then(keys => Promise.all(keys.map(key => caches.delete(key)))).catch(() => undefined);
+          }
+        } catch { /* cache API may be unavailable */ }
+        try {
+          const indexedDBFactory = window.indexedDB;
+          if (indexedDBFactory && typeof indexedDBFactory.databases === "function") {
+            indexedDBFactory.databases()
+              .then(databases => databases.forEach(database => {
+                if (database.name) indexedDBFactory.deleteDatabase(database.name);
+              }))
+              .catch(() => undefined);
+          }
+        } catch { /* indexedDB enumeration may be unavailable */ }
+      };
+      clearClientStorage();
+      window.addEventListener("pageshow", clearClientStorage, { once: true });
+    });
+    logger.info("Prepared fresh isolated browser context for scan; target-site cookies, cache storage, localStorage, sessionStorage, and IndexedDB are reset for this scan context only.");
+  }
   private async handleLogin(page: any, auth: any, targetUrl?: string): Promise<string> {
     try {
       const usernameSelector = this.authSelector(auth, "username_selector");
