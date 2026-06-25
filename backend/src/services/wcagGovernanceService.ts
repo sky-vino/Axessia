@@ -307,27 +307,15 @@ async function upsertReview(ruleId: string, currentWcag: string[], suggestedWcag
     return;
   }
 
-  try {
-    await db.query(
-      `INSERT INTO wcag_mapping_reviews (rule_id, current_wcag, suggested_wcag, reason, status, first_seen_at, last_seen_at)
-       VALUES ($1, $2, $3, $4, 'pending', datetime('now'), datetime('now'))
-       ON CONFLICT(rule_id, current_wcag, reason) DO UPDATE SET
-         suggested_wcag = excluded.suggested_wcag,
-         last_seen_at = datetime('now'),
-         status = CASE WHEN wcag_mapping_reviews.status = 'resolved' THEN 'pending' ELSE wcag_mapping_reviews.status END`,
-      [ruleId, currentJson, suggestedJson, reason]
-    );
-  } catch (error: any) {
-    if (error?.code !== "SQLITE_CONSTRAINT") throw error;
-    await db.query(
-      `UPDATE wcag_mapping_reviews
-       SET suggested_wcag = $3,
-           last_seen_at = datetime('now'),
-           status = CASE WHEN status = 'resolved' THEN 'pending' ELSE status END
-       WHERE rule_id = $1 AND current_wcag = $2 AND reason = $4`,
-      [ruleId, currentJson, suggestedJson, reason]
-    );
-  }
+  await db.query(
+    `INSERT INTO wcag_mapping_reviews (rule_id, current_wcag, suggested_wcag, reason, status, first_seen_at, last_seen_at)
+     VALUES ($1, $2, $3, $4, 'pending', datetime('now'), datetime('now'))
+     ON CONFLICT(rule_id, current_wcag, reason) DO UPDATE SET
+       suggested_wcag = excluded.suggested_wcag,
+       last_seen_at = datetime('now'),
+       status = CASE WHEN wcag_mapping_reviews.status = 'resolved' THEN 'pending' ELSE wcag_mapping_reviews.status END`,
+    [ruleId, currentJson, suggestedJson, reason]
+  );
 }
 
 async function criterionTitle(wcag: string): Promise<string | undefined> {

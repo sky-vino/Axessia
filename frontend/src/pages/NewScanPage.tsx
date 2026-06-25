@@ -113,6 +113,7 @@ export default function NewScanPage() {
   const [crawlIncludeText, setCrawlIncludeText] = useState("");
   const [crawlExcludeText, setCrawlExcludeText] = useState("");
   const [controlledAllowlistText, setControlledAllowlistText] = useState("");
+  const [selectedPostLoginPages, setSelectedPostLoginPages] = useState<string[]>([]);
   const [targetInteractions, setTargetInteractions] = useState<TargetInteraction[]>([]);
   const journeyOnlyMode = opts.scan_entry_mode === "journey";
 
@@ -185,12 +186,19 @@ export default function NewScanPage() {
         crawl_include_patterns: splitPatterns(crawlIncludeText),
         crawl_exclude_patterns: splitPatterns(crawlExcludeText),
         controlled_interaction_allowlist: splitPatterns(controlledAllowlistText),
-        post_login_pages: [],
+        post_login_pages: journeyOnlyMode ? [] : selectedPostLoginPages,
         target_interactions: journeyOnlyMode ? journeyTargets : [],
       }
     });
   };
 
+  const togglePostLoginPage = (label: string) => {
+    setSelectedPostLoginPages(current =>
+      current.includes(label)
+        ? current.filter(item => item !== label)
+        : AUTHENTICATED_PAGE_OPTIONS.filter(item => item === label || current.includes(item))
+    );
+  };
 
   const addTargetInteraction = () => setTargetInteractions(current => [
     ...current,
@@ -243,7 +251,7 @@ export default function NewScanPage() {
   };
 
   return (
-    <div className="p-8 w-full max-w-none">
+    <div className="p-8 max-w-3xl mx-auto">
       <button onClick={() => navigate("/")} className="flex items-center gap-1.5 text-sm text-slate-500 hover:text-slate-300 mb-6 transition-colors">
         <ArrowLeft size={14} /> Back to Dashboard
       </button>
@@ -327,182 +335,6 @@ export default function NewScanPage() {
                 </button>
               )}
             </div>
-          )}
-          {journeyOnlyMode && (
-          <div className="rounded-xl p-4 space-y-3" style={{ background: "rgba(255,255,255,0.025)", border: "1px solid var(--border)" }}>
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <h3 className="text-sm font-semibold text-slate-300">Targeted destination interactions</h3>
-                <p className="text-[11px] text-slate-600 mt-1 leading-relaxed">
-                  Use this when a selected page is only a launch point. Configure a single promo/link click, or a deterministic multi-step journey. Crawling remains separate and runs only when enabled.
-                </p>
-              </div>
-              <button type="button" onClick={addTargetInteraction}
-                className="flex-shrink-0 inline-flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg border text-accent hover:bg-white/[0.03]"
-                style={{ borderColor: "rgba(15,118,110,0.35)" }}>
-                <Plus size={13} /> Add target / journey
-              </button>
-            </div>
-
-            {targetInteractions.length > 0 && (
-              <div className="space-y-3">
-                {targetInteractions.map((target, index) => (
-                  <div key={index} className="rounded-lg p-3 space-y-3" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border)" }}>
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-xs font-semibold text-slate-400">Target #{index + 1}</span>
-                      <button type="button" onClick={() => removeTargetInteraction(index)}
-                        className="w-8 h-8 inline-flex items-center justify-center rounded-lg text-slate-600 hover:text-red-400 hover:bg-red-400/10">
-                        <Trash2 size={13} />
-                      </button>
-                    </div>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1.5">Target mode</label>
-                        <select style={inputStyle} value={target.mode} onChange={e => updateTargetInteraction(index, { mode: e.target.value as TargetInteraction["mode"] })}>
-                          <option value="single-interaction">Single promo/link click</option>
-                          <option value="journey">Multi-step journey</option>
-                        </select>
-                      </div>
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1.5">Launch page</label>
-                        <select style={inputStyle} value={target.base_page} onChange={e => updateTargetInteraction(index, { base_page: e.target.value })}>
-                          {AUTHENTICATED_PAGE_OPTIONS.map(label => <option key={label} value={label}>{label}</option>)}
-                        </select>
-                      </div>
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1.5">Target / journey name</label>
-                        <input style={inputStyle} placeholder="e.g. Netflix Standard offer"
-                          value={target.name} onChange={e => updateTargetInteraction(index, { name: e.target.value })} />
-                      </div>
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1.5">Click type</label>
-                        <select style={inputStyle} value={target.click_type} onChange={e => updateTargetInteraction(index, { click_type: e.target.value as TargetInteraction["click_type"] })}>
-                          <option value="button">Button / CTA</option>
-                          <option value="link">Link</option>
-                          <option value="heading-link">Heading/title link</option>
-                          <option value="any">Any interactive element</option>
-                        </select>
-                      </div>
-                    </div>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1.5">Visible text / accessible name</label>
-                        <input style={inputStyle} placeholder="e.g. Netflix Standard"
-                          value={target.text} onChange={e => updateTargetInteraction(index, { text: e.target.value })} />
-                      </div>
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1.5">CTA text inside card</label>
-                        <input style={inputStyle} placeholder="e.g. Scopri di piu"
-                          value={target.cta_text} onChange={e => updateTargetInteraction(index, { cta_text: e.target.value })} />
-                      </div>
-                    </div>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="block text-xs text-slate-500 mb-1.5">Href contains</label>
-                        <input style={inputStyle} placeholder="e.g. sky-wifi or /offerte/"
-                          value={target.href_contains} onChange={e => updateTargetInteraction(index, { href_contains: e.target.value })} />
-                      </div>
-                    </div>
-                    <div>
-                      <label className="block text-xs text-slate-500 mb-1.5">Selector fallback</label>
-                      <textarea rows={2} style={{ ...inputStyle, minHeight: 58, resize: "vertical" }}
-                        placeholder={"Optional. CSS, XPath, or js= selector for the exact card/link/button."}
-                        value={target.selector} onChange={e => updateTargetInteraction(index, { selector: e.target.value })} />
-                    </div>
-                    <div className="grid grid-cols-1 gap-2">
-                      <Toggle checked={target.scan_destination_only}
-                        onChange={v => updateTargetInteraction(index, { scan_destination_only: v })}
-                        label="Use launch page only for navigation; scan the destination/final target" />
-                      <Toggle checked={target.scan_launch_page}
-                        onChange={v => updateTargetInteraction(index, { scan_launch_page: v })}
-                        label="Also scan the launch page before executing this target" />
-                    </div>
-                    {target.mode === "journey" && (
-                      <div className="rounded-lg p-3 space-y-3" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border)" }}>
-                        <div className="flex items-center justify-between gap-3">
-                          <div>
-                            <h4 className="text-xs font-semibold text-slate-300">Journey steps</h4>
-                            <p className="text-[11px] text-slate-600 mt-1">Use navigation steps for known pages and click steps for links/buttons. Enable scan on the final step, or leave all off to scan the final page automatically.</p>
-                          </div>
-                          <button type="button" onClick={() => addJourneyStep(index)}
-                            className="inline-flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg border text-accent hover:bg-white/[0.03]"
-                            style={{ borderColor: "rgba(15,118,110,0.35)" }}>
-                            <Plus size={13} /> Add step
-                          </button>
-                        </div>
-                        {target.steps.map((step, stepIndex) => (
-                          <div key={stepIndex} className="rounded-lg p-3 space-y-3" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border)" }}>
-                            <div className="flex items-center justify-between">
-                              <span className="text-[11px] font-semibold text-slate-500">Step #{stepIndex + 1}</span>
-                              <button type="button" onClick={() => removeJourneyStep(index, stepIndex)}
-                                className="w-7 h-7 inline-flex items-center justify-center rounded-lg text-slate-600 hover:text-red-400 hover:bg-red-400/10">
-                                <Trash2 size={12} />
-                              </button>
-                            </div>
-                            <div className="grid grid-cols-2 gap-3">
-                              <div>
-                                <label className="block text-xs text-slate-500 mb-1.5">Action</label>
-                                <select style={inputStyle} value={step.action} onChange={e => updateJourneyStep(index, stepIndex, { action: e.target.value as TargetJourneyStep["action"] })}>
-                                  <option value="navigate-page">Navigate known page</option>
-                                  <option value="click">Click link/button</option>
-                                </select>
-                              </div>
-                              <div>
-                                <label className="block text-xs text-slate-500 mb-1.5">Step name</label>
-                                <input style={inputStyle} placeholder="Optional label" value={step.name} onChange={e => updateJourneyStep(index, stepIndex, { name: e.target.value })} />
-                              </div>
-                            </div>
-                            {step.action === "navigate-page" ? (
-                              <div>
-                                <label className="block text-xs text-slate-500 mb-1.5">Page</label>
-                                <select style={inputStyle} value={step.page} onChange={e => updateJourneyStep(index, stepIndex, { page: e.target.value })}>
-                                  <option value="">Select page</option>
-                                  {AUTHENTICATED_PAGE_OPTIONS.map(label => <option key={label} value={label}>{label}</option>)}
-                                </select>
-                              </div>
-                            ) : (
-                              <>
-                                <div className="grid grid-cols-2 gap-3">
-                                  <div>
-                                    <label className="block text-xs text-slate-500 mb-1.5">Container / visible text</label>
-                                    <input style={inputStyle} placeholder="e.g. Dispositivi e protezioni" value={step.text} onChange={e => updateJourneyStep(index, stepIndex, { text: e.target.value })} />
-                                  </div>
-                                  <div>
-                                    <label className="block text-xs text-slate-500 mb-1.5">CTA text</label>
-                                    <input style={inputStyle} placeholder="Optional button text" value={step.cta_text} onChange={e => updateJourneyStep(index, stepIndex, { cta_text: e.target.value })} />
-                                  </div>
-                                </div>
-                                <div className="grid grid-cols-2 gap-3">
-                                  <div>
-                                    <label className="block text-xs text-slate-500 mb-1.5">Href contains</label>
-                                    <input style={inputStyle} placeholder="Optional URL fragment" value={step.href_contains} onChange={e => updateJourneyStep(index, stepIndex, { href_contains: e.target.value })} />
-                                  </div>
-                                  <div>
-                                    <label className="block text-xs text-slate-500 mb-1.5">Click type</label>
-                                    <select style={inputStyle} value={step.click_type} onChange={e => updateJourneyStep(index, stepIndex, { click_type: e.target.value as TargetJourneyStep["click_type"] })}>
-                                      <option value="any">Any interactive element</option>
-                                      <option value="button">Button / CTA</option>
-                                      <option value="link">Link</option>
-                                      <option value="heading-link">Heading/title link</option>
-                                    </select>
-                                  </div>
-                                </div>
-                                <div>
-                                  <label className="block text-xs text-slate-500 mb-1.5">Selector fallback</label>
-                                  <textarea rows={2} style={{ ...inputStyle, minHeight: 54, resize: "vertical" }} value={step.selector} onChange={e => updateJourneyStep(index, stepIndex, { selector: e.target.value })} />
-                                </div>
-                              </>
-                            )}
-                            <Toggle checked={step.scan_after_step} onChange={v => updateJourneyStep(index, stepIndex, { scan_after_step: v })} label="Scan the page/state reached after this step" />
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
           )}
         </motion.div>
 
@@ -661,6 +493,204 @@ export default function NewScanPage() {
                 <p className="text-[11px] text-slate-600 leading-relaxed">
                   When these are off, the scanner may still use login or Gestisci for authentication/navigation, but it will not run accessibility modules on those pages.
                 </p>
+              </div>
+              <div>
+                <label className="block text-xs text-slate-500 mb-1.5">Authenticated pages to scan after Gestisci</label>
+                <div className="grid gap-2" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))" }}>
+                  {AUTHENTICATED_PAGE_OPTIONS.map(label => (
+                    <label
+                      key={label}
+                      className="flex items-center gap-2 rounded-lg px-3 py-2 cursor-pointer transition-colors hover:bg-white/[0.03]"
+                      style={{ background: "rgba(255,255,255,0.025)", border: "1px solid var(--border)" }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedPostLoginPages.includes(label)}
+                        onChange={() => togglePostLoginPage(label)}
+                        className="h-4 w-4"
+                      />
+                      <span className="text-sm text-slate-300">{label}</span>
+                    </label>
+                  ))}
+                </div>
+                <p className="text-[11px] text-slate-600 mt-2 leading-relaxed">
+                  The scanner logs in, uses Gestisci as the navigation root when needed, checks keyboard tab access for selected navigation items, then fully scans only the selected pages.
+                </p>
+              </div>
+
+              <div className="rounded-xl p-4 space-y-3" style={{ background: "rgba(255,255,255,0.025)", border: "1px solid var(--border)" }}>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-300">Targeted destination interactions</h3>
+                    <p className="text-[11px] text-slate-600 mt-1 leading-relaxed">
+                      Use this when a selected page is only a launch point. Configure a single promo/link click, or a deterministic multi-step journey. Crawling remains separate and runs only when enabled.
+                    </p>
+                  </div>
+                  <button type="button" onClick={addTargetInteraction}
+                    className="flex-shrink-0 inline-flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg border text-accent hover:bg-white/[0.03]"
+                    style={{ borderColor: "rgba(15,118,110,0.35)" }}>
+                    <Plus size={13} /> Add target / journey
+                  </button>
+                </div>
+
+                {targetInteractions.length > 0 && (
+                  <div className="space-y-3">
+                    {targetInteractions.map((target, index) => (
+                      <div key={index} className="rounded-lg p-3 space-y-3" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border)" }}>
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-xs font-semibold text-slate-400">Target #{index + 1}</span>
+                          <button type="button" onClick={() => removeTargetInteraction(index)}
+                            className="w-8 h-8 inline-flex items-center justify-center rounded-lg text-slate-600 hover:text-red-400 hover:bg-red-400/10">
+                            <Trash2 size={13} />
+                          </button>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-xs text-slate-500 mb-1.5">Target mode</label>
+                            <select style={inputStyle} value={target.mode} onChange={e => updateTargetInteraction(index, { mode: e.target.value as TargetInteraction["mode"] })}>
+                              <option value="single-interaction">Single promo/link click</option>
+                              <option value="journey">Multi-step journey</option>
+                            </select>
+                          </div>
+                          <div>
+                            <label className="block text-xs text-slate-500 mb-1.5">Launch page</label>
+                            <select style={inputStyle} value={target.base_page} onChange={e => updateTargetInteraction(index, { base_page: e.target.value })}>
+                              {AUTHENTICATED_PAGE_OPTIONS.map(label => <option key={label} value={label}>{label}</option>)}
+                            </select>
+                          </div>
+                          <div>
+                            <label className="block text-xs text-slate-500 mb-1.5">Target / journey name</label>
+                            <input style={inputStyle} placeholder="e.g. Netflix Standard offer"
+                              value={target.name} onChange={e => updateTargetInteraction(index, { name: e.target.value })} />
+                          </div>
+                          <div>
+                            <label className="block text-xs text-slate-500 mb-1.5">Click type</label>
+                            <select style={inputStyle} value={target.click_type} onChange={e => updateTargetInteraction(index, { click_type: e.target.value as TargetInteraction["click_type"] })}>
+                              <option value="button">Button / CTA</option>
+                              <option value="link">Link</option>
+                              <option value="heading-link">Heading/title link</option>
+                              <option value="any">Any interactive element</option>
+                            </select>
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-xs text-slate-500 mb-1.5">Visible text / accessible name</label>
+                            <input style={inputStyle} placeholder="e.g. Netflix Standard"
+                              value={target.text} onChange={e => updateTargetInteraction(index, { text: e.target.value })} />
+                          </div>
+                          <div>
+                            <label className="block text-xs text-slate-500 mb-1.5">CTA text inside card</label>
+                            <input style={inputStyle} placeholder="e.g. Scopri di piu"
+                              value={target.cta_text} onChange={e => updateTargetInteraction(index, { cta_text: e.target.value })} />
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-xs text-slate-500 mb-1.5">Href contains</label>
+                            <input style={inputStyle} placeholder="e.g. sky-wifi or /offerte/"
+                              value={target.href_contains} onChange={e => updateTargetInteraction(index, { href_contains: e.target.value })} />
+                          </div>
+                        </div>
+                        <div>
+                          <label className="block text-xs text-slate-500 mb-1.5">Selector fallback</label>
+                          <textarea rows={2} style={{ ...inputStyle, minHeight: 58, resize: "vertical" }}
+                            placeholder={"Optional. CSS, XPath, or js= selector for the exact card/link/button."}
+                            value={target.selector} onChange={e => updateTargetInteraction(index, { selector: e.target.value })} />
+                        </div>
+                        <div className="grid grid-cols-1 gap-2">
+                          <Toggle checked={target.scan_destination_only}
+                            onChange={v => updateTargetInteraction(index, { scan_destination_only: v })}
+                            label="Use launch page only for navigation; scan the destination/final target" />
+                          <Toggle checked={target.scan_launch_page}
+                            onChange={v => updateTargetInteraction(index, { scan_launch_page: v })}
+                            label="Also scan the launch page before executing this target" />
+                        </div>
+                        {target.mode === "journey" && (
+                          <div className="rounded-lg p-3 space-y-3" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border)" }}>
+                            <div className="flex items-center justify-between gap-3">
+                              <div>
+                                <h4 className="text-xs font-semibold text-slate-300">Journey steps</h4>
+                                <p className="text-[11px] text-slate-600 mt-1">Use navigation steps for known pages and click steps for links/buttons. Enable scan on the final step, or leave all off to scan the final page automatically.</p>
+                              </div>
+                              <button type="button" onClick={() => addJourneyStep(index)}
+                                className="inline-flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg border text-accent hover:bg-white/[0.03]"
+                                style={{ borderColor: "rgba(15,118,110,0.35)" }}>
+                                <Plus size={13} /> Add step
+                              </button>
+                            </div>
+                            {target.steps.map((step, stepIndex) => (
+                              <div key={stepIndex} className="rounded-lg p-3 space-y-3" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border)" }}>
+                                <div className="flex items-center justify-between">
+                                  <span className="text-[11px] font-semibold text-slate-500">Step #{stepIndex + 1}</span>
+                                  <button type="button" onClick={() => removeJourneyStep(index, stepIndex)}
+                                    className="w-7 h-7 inline-flex items-center justify-center rounded-lg text-slate-600 hover:text-red-400 hover:bg-red-400/10">
+                                    <Trash2 size={12} />
+                                  </button>
+                                </div>
+                                <div className="grid grid-cols-2 gap-3">
+                                  <div>
+                                    <label className="block text-xs text-slate-500 mb-1.5">Action</label>
+                                    <select style={inputStyle} value={step.action} onChange={e => updateJourneyStep(index, stepIndex, { action: e.target.value as TargetJourneyStep["action"] })}>
+                                      <option value="navigate-page">Navigate known page</option>
+                                      <option value="click">Click link/button</option>
+                                    </select>
+                                  </div>
+                                  <div>
+                                    <label className="block text-xs text-slate-500 mb-1.5">Step name</label>
+                                    <input style={inputStyle} placeholder="Optional label" value={step.name} onChange={e => updateJourneyStep(index, stepIndex, { name: e.target.value })} />
+                                  </div>
+                                </div>
+                                {step.action === "navigate-page" ? (
+                                  <div>
+                                    <label className="block text-xs text-slate-500 mb-1.5">Page</label>
+                                    <select style={inputStyle} value={step.page} onChange={e => updateJourneyStep(index, stepIndex, { page: e.target.value })}>
+                                      <option value="">Select page</option>
+                                      {AUTHENTICATED_PAGE_OPTIONS.map(label => <option key={label} value={label}>{label}</option>)}
+                                    </select>
+                                  </div>
+                                ) : (
+                                  <>
+                                    <div className="grid grid-cols-2 gap-3">
+                                      <div>
+                                        <label className="block text-xs text-slate-500 mb-1.5">Container / visible text</label>
+                                        <input style={inputStyle} placeholder="e.g. Dispositivi e protezioni" value={step.text} onChange={e => updateJourneyStep(index, stepIndex, { text: e.target.value })} />
+                                      </div>
+                                      <div>
+                                        <label className="block text-xs text-slate-500 mb-1.5">CTA text</label>
+                                        <input style={inputStyle} placeholder="Optional button text" value={step.cta_text} onChange={e => updateJourneyStep(index, stepIndex, { cta_text: e.target.value })} />
+                                      </div>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3">
+                                      <div>
+                                        <label className="block text-xs text-slate-500 mb-1.5">Href contains</label>
+                                        <input style={inputStyle} placeholder="Optional URL fragment" value={step.href_contains} onChange={e => updateJourneyStep(index, stepIndex, { href_contains: e.target.value })} />
+                                      </div>
+                                      <div>
+                                        <label className="block text-xs text-slate-500 mb-1.5">Click type</label>
+                                        <select style={inputStyle} value={step.click_type} onChange={e => updateJourneyStep(index, stepIndex, { click_type: e.target.value as TargetJourneyStep["click_type"] })}>
+                                          <option value="any">Any interactive element</option>
+                                          <option value="button">Button / CTA</option>
+                                          <option value="link">Link</option>
+                                          <option value="heading-link">Heading/title link</option>
+                                        </select>
+                                      </div>
+                                    </div>
+                                    <div>
+                                      <label className="block text-xs text-slate-500 mb-1.5">Selector fallback</label>
+                                      <textarea rows={2} style={{ ...inputStyle, minHeight: 54, resize: "vertical" }} value={step.selector} onChange={e => updateJourneyStep(index, stepIndex, { selector: e.target.value })} />
+                                    </div>
+                                  </>
+                                )}
+                                <Toggle checked={step.scan_after_step} onChange={v => updateJourneyStep(index, stepIndex, { scan_after_step: v })} label="Scan the page/state reached after this step" />
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           )}
