@@ -286,6 +286,26 @@ function suspiciousReason(ruleId: string, title: string, wcag: string, criterion
 async function upsertReview(ruleId: string, currentWcag: string[], suggestedWcag: string[], reason: string): Promise<void> {
   const currentJson = JSON.stringify(normalizeCriteria(currentWcag));
   const suggestedJson = JSON.stringify(normalizeCriteria(suggestedWcag));
+  const existing = await db.query<{ id: string }>(
+    `SELECT id
+     FROM wcag_mapping_reviews
+     WHERE rule_id = $1 AND current_wcag = $2 AND status = 'pending'
+     ORDER BY last_seen_at DESC
+     LIMIT 1`,
+    [ruleId, currentJson]
+  );
+
+  if (existing.rows[0]?.id) {
+    await db.query(
+      `UPDATE wcag_mapping_reviews
+       SET suggested_wcag = $2,
+           reason = $3,
+           last_seen_at = datetime('now')
+       WHERE id = $1`,
+      [existing.rows[0].id, suggestedJson, reason]
+    );
+    return;
+  }
 
   try {
     await db.query(
@@ -384,8 +404,8 @@ async function resolveStaleNormalizedReviewRows(): Promise<void> {
 }
 
 async function collapseDuplicatePendingReviews(): Promise<void> {
-  const rows = await db.query<{ id: string; rule_id: string; current_wcag: any; suggested_wcag: any; reason: string; last_seen_at: string }>(
-    `SELECT id, rule_id, current_wcag, suggested_wcag, reason, last_seen_at
+  const rows = await db.query<{ id: string; rule_id: string; current_wcag: any; suggested_wcag: any; last_seen_at: string }>(
+    `SELECT id, rule_id, current_wcag, suggested_wcag, last_seen_at
      FROM wcag_mapping_reviews
      WHERE status = 'pending'
      ORDER BY last_seen_at DESC`
@@ -395,33 +415,20 @@ async function collapseDuplicatePendingReviews(): Promise<void> {
   for (const row of rows.rows) {
     const currentJson = JSON.stringify(normalizeCriteria(parseMaybeJsonArray(row.current_wcag)));
     const suggestedJson = JSON.stringify(normalizeCriteria(parseMaybeJsonArray(row.suggested_wcag)));
-    const reason = String(row.reason || "");
-    const key = `${row.rule_id}|${currentJson}|${reason}`;
+    const key = `${row.rule_id}|${currentJson}`;
     const keepId = seen.get(key);
 
     if (!keepId) {
       seen.set(key, row.id);
       if (currentJson !== JSON.stringify(parseMaybeJsonArray(row.current_wcag)) || suggestedJson !== JSON.stringify(parseMaybeJsonArray(row.suggested_wcag))) {
-        try {
-          await db.query(
-            `UPDATE wcag_mapping_reviews
-             SET current_wcag = $2,
-                 suggested_wcag = $3,
-                 last_seen_at = datetime('now')
-             WHERE id = $1`,
-            [row.id, currentJson, suggestedJson]
-          );
-        } catch (error: any) {
-          if (error?.code !== "SQLITE_CONSTRAINT") throw error;
-          await db.query(
-            `UPDATE wcag_mapping_reviews
-             SET status = 'resolved',
-                 resolved_at = COALESCE(resolved_at, datetime('now')),
-                 last_seen_at = datetime('now')
-             WHERE id = $1`,
-            [row.id]
-          );
-        }
+        await db.query(
+          `UPDATE wcag_mapping_reviews
+           SET current_wcag = $2,
+               suggested_wcag = $3,
+               last_seen_at = datetime('now')
+           WHERE id = $1`,
+          [row.id, currentJson, suggestedJson]
+        );
       }
       continue;
     }
