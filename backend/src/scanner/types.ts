@@ -54,30 +54,8 @@ export interface TestCase {
   issueId?: string;
   issueRuleId?: string;
   issueUrl?: string;
-  steps?: Array<string | TestProcedureStepCoverage>;
+  steps?: string[];
   result?: string;
-}
-
-export interface TestProcedureStepCoverage {
-  stepNumber: number;
-  stepText: string;
-  coverageType: "automated" | "hybrid" | "manual";
-  scannerModule: string;
-  status: "pass" | "fail" | "pending";
-  evidence: string;
-}
-
-export type ExcelProcedureAction = "navigate-url" | "navigation-path" | "click" | "scan" | "manual";
-
-export interface ExcelProcedureStep {
-  stepNumber: number;
-  expected: string;
-  actual?: string;
-  action: ExcelProcedureAction;
-  url?: string;
-  path?: string[];
-  targetText?: string;
-  scanAfterStep?: boolean;
 }
 
 export interface StateConfig {
@@ -89,61 +67,8 @@ export interface StateConfig {
   description?: string;
 }
 
-export type TargetInteractionMode = "single-interaction" | "journey";
-export type TargetClickType = "button" | "link" | "heading-link" | "any";
-export type TargetStepAction = "navigate-page" | "click";
-
-export interface TargetJourneyStep {
-  action: TargetStepAction;
-  page?: string;
-  name?: string;
-  selector?: string;
-  text?: string;
-  cta_text?: string;
-  href_contains?: string;
-  click_type?: TargetClickType;
-  scan_after_step?: boolean;
-}
-
-export interface TargetInteractionConfig {
-  /** Authenticated navigation/page label used as a launch point, for example Offerte or Fatture. */
-  base_page: string;
-  /** single-interaction scans one clicked destination; journey executes ordered navigate/click steps. */
-  mode?: TargetInteractionMode;
-  /** Human readable name shown in scan progress and generated test cases. */
-  name?: string;
-  /** CSS/XPath/JS selector for the exact link/button/card CTA. */
-  selector?: string;
-  /** Visible text or accessible name to match, usually the promo/card heading. */
-  text?: string;
-  /** CTA text inside the matched card/container, for example "Scopri di piu". */
-  cta_text?: string;
-  /** URL fragment/pattern expected in the target href. */
-  href_contains?: string;
-  /** Restricts which interactive element kind should be clicked. */
-  click_type?: TargetClickType;
-  /** If true, the base page is only used for navigation; only the destination is scanned. */
-  scan_destination_only?: boolean;
-  /** If true, scan the launch page before clicking. Defaults to false for targeted test cases. */
-  scan_launch_page?: boolean;
-  /** Ordered deterministic steps for multi-page target journeys. */
-  steps?: TargetJourneyStep[];
-}
-
-export type ControlledInteractionMode = "safe-auto" | "tester-selected" | "exhaustive";
-
-export interface ControlledInteractionReportItem {
-  label: string;
-  selector: string;
-  kind: string;
-  href?: string;
-  status: "clicked" | "skipped" | "blocked" | "failed" | "scanned";
-  outcome?: string;
-  reason?: string;
-  scannedUrl?: string;
-}
-
 export interface ScanOptions {
+  workflow_type?: "generic" | "sky" | string;
   run_axe?: boolean;
   run_heuristics?: boolean;
   run_focus?: boolean;
@@ -161,8 +86,6 @@ export interface ScanOptions {
   viewport_height?: number;
   headful?: boolean;
   extra_states?: StateConfig[];
-  /** url = scan supplied target URLs; journey = use target URLs only as auth/start context and scan configured journeys. */
-  scan_entry_mode?: "url" | "journey";
   /** When true, after login the scanner BFS-discovers links from each seed URL and scans up to crawl_max_pages per seed. */
   crawl_mode?: boolean;
   /** Max link hops from the seed URL (0 = seed only, 1 = seed + direct links, …). Capped at 10. */
@@ -179,28 +102,12 @@ export interface ScanOptions {
   scan_login_page?: boolean;
   /** After OTP/auth completes, scan the page where the browser actually lands. */
   scan_post_login_landing?: boolean;
-  /** Scan the authenticated Gestisci/profile page. When false it can still be used only as a navigation root. */
-  scan_gestisci_page?: boolean;
   /** After landing post-login, scan visible tab/navigation states on that page. */
   post_login_tab_scan?: boolean;
   /** Max tab/navigation states to scan after login. */
   post_login_tab_limit?: number;
   /** Ordered authenticated navigation labels/pages to scan after landing. */
   post_login_pages?: string[];
-  /** Targeted one-off interactions. The scanner navigates to base_page, clicks only the matching target, then scans the destination. */
-  target_interactions?: TargetInteractionConfig[];
-  /** Discover and test links/buttons on scanned pages using safety rules and mode limits. */
-  controlled_interaction_scan?: boolean;
-  /** safe-auto = safe controls only; tester-selected = allowlist only; exhaustive = broader non-destructive exploration. */
-  controlled_interaction_mode?: ControlledInteractionMode;
-  /** Labels, URL fragments, or CSS selectors that are allowed in tester-selected mode. */
-  controlled_interaction_allowlist?: string[];
-  /** Maximum discovered interactions to attempt per page. */
-  controlled_interaction_limit?: number;
-  /** Optional pasted business/test procedure steps to map against scanner coverage. */
-  test_procedure_steps?: string[];
-  /** Structured steps parsed from an uploaded Excel procedure. Executable rows can drive navigation before scanning. */
-  excel_procedure_steps?: ExcelProcedureStep[];
 }
 
 export type ProgressCallback = (progress: number, message: string) => void;

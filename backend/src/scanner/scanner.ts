@@ -16,7 +16,7 @@
  */
 
 import { chromium } from "playwright";
-import type { ScanOptions, ProgressCallback, ScanIssue, DomSnapshot, TestCase, StateConfig, TargetInteractionConfig, TargetJourneyStep, TestProcedureStepCoverage, ExcelProcedureStep, ControlledInteractionReportItem } from "./types";
+import type { ScanOptions, ProgressCallback, ScanIssue, DomSnapshot, TestCase, StateConfig } from "./types";
 import { navigateSafely } from "./navigation";
 import { runAxe } from "./axeScan";
 import { runHeuristics } from "./heuristics";
@@ -37,16 +37,32 @@ export interface ScanResult {
   score: number;
 }
 
+interface LoginNetworkDiagnostics {
+  clientAuthorizeHit: boolean;
+  clientAuthorizeStatus?: number;
+  clientAuthorizeFailure?: string;
+  userLoginHit: boolean;
+  userLoginStatus?: number;
+  userLoginFailure?: string;
+  userLoginPreview?: string;
+  importantIncidents: string[];
+}
+
 export class AccessibilityScanner {
   private scan: any;
   private onProgress: ProgressCallback;
   private allIssues: ScanIssue[] = [];
   private testCases: TestCase[] = [];
   private domSnapshots: DomSnapshot[] = [];
-  private navigationStartTime = Date.now();
+  private scannedPageKeys = new Set<string>();
   private navigatedUrls: string[] = [];
   private navigatedUrlKeys = new Set<string>();
-  private scannedPageKeys = new Set<string>();
+  private loginNetworkDiagnostics: LoginNetworkDiagnostics = {
+    clientAuthorizeHit: false,
+    userLoginHit: false,
+    importantIncidents: [],
+  };
+  private importantNetworkPending = new Map<any, { method: string; url: string; startedAt: number }>();
 
   constructor(scan: any, onProgress: ProgressCallback) {
     this.scan = scan;
@@ -54,15 +70,13 @@ export class AccessibilityScanner {
   }
 
   async run(): Promise<ScanResult> {
-    this.navigationStartTime = Date.now();
     const opts: ScanOptions = { ...this.scan.scan_options };
     const urls: string[] = this.scan.urls || [];
     const authConfig = this.scan.auth_config;
+    const workflowType = opts.workflow_type || authConfig?.workflow_type || "generic";
+    const isSkyWorkflow = workflowType === "sky";
     const extraStates = opts.extra_states || [];
     const scannedEntrypoints = new Set<string>();
-    const hasDestinationOnlyTargetInteractions = (Array.isArray(opts.target_interactions) ? opts.target_interactions : [])
-      .some(target => target && target.scan_destination_only !== false);
-    const journeyOnlyMode = opts.scan_entry_mode === "journey" || hasDestinationOnlyTargetInteractions;
 
     const stepsPerUrl = 12;
     const maxPerSeed = opts.crawl_mode
@@ -76,9 +90,21 @@ export class AccessibilityScanner {
       this.onProgress(Math.min(Math.round((stepsDone / totalSteps) * 94) + 1, 94), msg);
     };
 
+    // headless:true is REQUIRED on Azure App Service Linux (no display server).
+    // The extra args reduce automation fingerprint so CDN bot detection is less
+    // aggressive than against the default Playwright profile.
     const browser = await chromium.launch({
-      headless: false,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-extensions",
+        "--no-first-run",
+        "--window-size=1366,768",
+      ],
     });
 
     try {
@@ -91,10 +117,10 @@ export class AccessibilityScanner {
             if (opts.scan_login_page !== false && !scannedEntrypoints.has(loginKey)) {
               const loginContext = await this.createBrowserContext(browser, opts);
               const loginPage = await loginContext.newPage();
-              this.trackPageNavigations(loginPage, "login page");
               try {
                 progress(`Scanning login page before authentication: ${authConfig.login_url}`);
-                const ok = await this.navigateAndRecord(loginPage, authConfig.login_url, "login page");
+                  this.trackPageNavigations(loginPage, "login page");
+                  const ok = await this.navigateAndRecord(loginPage, authConfig.login_url, "login page");
                 if (ok) {
                   await loginPage.waitForTimeout(1200);
                   if (authConfig.auto_accept_cookies !== false) {
@@ -110,73 +136,69 @@ export class AccessibilityScanner {
               }
             }
             //Creates browser context and waits till login authentication is completed
-            const context = await this.createBrowserContext(browser, opts);
-            const page = await context.newPage();
-            this.trackPageNavigations(page, "authenticated session");
-            try {
-              progress(`Authenticating with OTP flow for ${url}`);
-              const landedUrl = await this.handleLogin(page, authConfig, url);
-              progress(`SUCCESS: Login and OTP completed; landed on ${landedUrl}`);
+              const context = await this.createBrowserContext(browser, opts);
+              const page = await context.newPage();
+              this.trackPageNavigations(page, "authenticated session");
+              try {
+              progress(isSkyWorkflow ? `Authenticating with Sky login and OTP flow for ${url}` : `Authenticating with generic login flow for ${url}`);
+              const landedUrl = await this.handleLogin(page, authConfig);
+              progress(isSkyWorkflow ? `SUCCESS: Sky login and OTP completed; landed on ${landedUrl}` : `SUCCESS: Login completed; landed on ${landedUrl}`);
               const landedKey = canonicalUrlKey(landedUrl) || landedUrl;
               const landedAuthKey = `auth:${landedKey}`;
 
-              const landedIsTarget = landedUrl ? this.sameUrlWithoutHash(landedUrl, url) : false;
-              if (!journeyOnlyMode && opts.scan_post_login_landing !== false && landedIsTarget && landedUrl && !scannedEntrypoints.has(landedAuthKey)) {
+              if (opts.scan_post_login_landing !== false && landedUrl && !scannedEntrypoints.has(landedAuthKey)) {
                 progress(`Scanning post-login landing page: ${landedUrl}`);
                 await this.ensureAuthenticatedPage(page, authConfig, landedUrl);
                 await this.runFullPageScan(page, landedUrl, opts, extraStates, progress);
                 progress(`SUCCESS: Completed authenticated landing scan`);
                 scannedEntrypoints.add(landedAuthKey);
-                if (opts.crawl_mode && opts.post_login_tab_scan !== false) {
+                if (isSkyWorkflow && opts.post_login_tab_scan !== false) {
                   const tabLimit = Math.min(Math.max(1, opts.post_login_tab_limit ?? 12), 30);
                   await this.scanLinkedPageStates(page, landedUrl, opts, extraStates, progress, tabLimit);
                 }
-              } else if (!journeyOnlyMode && opts.scan_post_login_landing !== false && landedUrl && !landedIsTarget) {
-                progress(`Skipping post-login landing scan because it is not the requested target URL: ${landedUrl}`);
               }
 
-              const profileUrl = String(authConfig.profile_url || "").trim();
+              const profileUrl = isSkyWorkflow ? (authConfig.profile_url || url) : url;
               const profileKey = canonicalUrlKey(profileUrl) || profileUrl;
               const profileAuthKey = `auth:${profileKey}`;
-              if (!journeyOnlyMode && opts.scan_gestisci_page !== false && profileUrl && !scannedEntrypoints.has(profileAuthKey)) {
-                progress(`Opening authenticated profile page: ${profileUrl}`);
-                const ok = await this.navigateAndRecord(page, profileUrl, "Gestisci/profile");
+              if (profileUrl && !scannedEntrypoints.has(profileAuthKey)) {
+                progress(isSkyWorkflow ? `Opening authenticated profile/Gestisci page: ${profileUrl}` : `Opening authenticated target page: ${profileUrl}`);
+                const ok = await this.navigateAndRecord(page, profileUrl, "authenticated profile/Gestisci page");
                 if (!ok) throw new Error(`Authenticated profile page is unreachable: ${profileUrl}`);
                 await page.waitForTimeout(1500);
                 await this.ensureAuthenticatedPage(page, authConfig, profileUrl);
                 await this.runFullPageScan(page, profileUrl, opts, extraStates, progress);
-                progress(`SUCCESS: Completed authenticated profile/Gestisci scan`);
+                progress(isSkyWorkflow ? `SUCCESS: Completed authenticated profile/Gestisci scan` : `SUCCESS: Completed authenticated target scan`);
                 scannedEntrypoints.add(profileAuthKey);
-                if (opts.crawl_mode && opts.post_login_tab_scan !== false) {
+                if (isSkyWorkflow && opts.post_login_tab_scan !== false) {
                   const tabLimit = Math.min(Math.max(1, opts.post_login_tab_limit ?? 12), 30);
                   await this.scanLinkedPageStates(page, profileUrl, opts, extraStates, progress, tabLimit);
                 }
               }
 
+              if (isSkyWorkflow) {
+                await this.scanConfiguredPostLoginPages(page, profileUrl || landedUrl || url, opts, extraStates, progress, scannedEntrypoints, authConfig);
+              }
+
               const targetKey = canonicalUrlKey(url) || url;
               const targetAuthKey = `auth:${targetKey}`;
-              if (journeyOnlyMode) {
-                progress(`Journey-only mode enabled; using ${url} only for authentication/start context`);
-              } else if (opts.crawl_mode) {
+              if (opts.crawl_mode) {
                 await this.runCrawlBfsForSeed(page, url, opts, extraStates, progress);
               } else if (!scannedEntrypoints.has(targetAuthKey)) {
                 progress(`Navigating to authenticated target ${url}`);
-                const actualTargetUrl = await this.openAuthenticatedTarget(page, authConfig, url, progress);
-                if (!actualTargetUrl) {
+                const ok = await this.navigateAndRecord(page, url, "authenticated target");
+                if (!ok) {
+                  logger.warn(`Skipping unreachable URL: ${url}`);
                   continue;
                 }
-                await this.runFullPageScan(page, actualTargetUrl || url, opts, extraStates, progress, url);
+                await page.waitForTimeout(1200);
+                await this.ensureAuthenticatedPage(page, authConfig, url);
+                await this.runFullPageScan(page, url, opts, extraStates, progress);
                 scannedEntrypoints.add(targetAuthKey);
-                if (opts.crawl_mode) {
+                if (isSkyWorkflow) {
                   await this.scanLinkedPageStates(page, url, opts, extraStates, progress);
                 }
               }
-
-              if (!journeyOnlyMode) {
-                await this.scanExcelProcedureSteps(page, profileUrl || landedUrl || url, opts, extraStates, progress, scannedEntrypoints, authConfig);
-                await this.scanConfiguredPostLoginPages(page, profileUrl || landedUrl || url, opts, extraStates, progress, scannedEntrypoints, authConfig);
-              }
-              await this.scanTargetedInteractions(page, profileUrl || landedUrl || url, opts, extraStates, progress, scannedEntrypoints, authConfig);
             } finally {
               await context.close();
             }
@@ -192,15 +214,14 @@ export class AccessibilityScanner {
               await this.runCrawlBfsForSeed(page, url, opts, extraStates, progress);
             } else {
               progress(`Navigating to ${url}`);
-              const ok = await this.navigateAndRecord(page, url, "target");
+              const ok = await this.navigateAndRecord(page, url, "scan target");
               if (!ok) {
                 logger.warn(`Skipping unreachable URL: ${url}`);
                 continue;
               }
               await page.waitForTimeout(1200);
               await this.runFullPageScan(page, url, opts, extraStates, progress);
-              await this.scanExcelProcedureSteps(page, url, opts, extraStates, progress, this.scannedPageKeys, null);
-              if (opts.crawl_mode) {
+              if (isSkyWorkflow) {
                 await this.scanLinkedPageStates(page, url, opts, extraStates, progress);
               }
             }
@@ -210,7 +231,6 @@ export class AccessibilityScanner {
 
         } catch (err) {
           logger.error(`Error scanning ${url}:`, err);
-          this.addScanRunFailureIssue(url, err);
         }
       }
     } finally {
@@ -220,23 +240,88 @@ export class AccessibilityScanner {
     this.allIssues = this.prioritizeIssues(this.calibrateIssues(this.deduplicateIssues(this.allIssues)));
     this.generateTestCases();
     this.generateManualHybridReviewCases();
-    this.generateTestProcedureCoverage(opts);
     const score = this.computeScore(this.allIssues);
     logger.info(`Scan navigation trail (${this.navigatedUrls.length} URL${this.navigatedUrls.length === 1 ? "" : "s"}): ${this.navigatedUrls.join(" -> ") || "none recorded"}`);
     logger.info(`Scan complete: ${this.allIssues.length} issues, score ${score}`);
     return { issues: this.allIssues, testCases: this.testCases, domSnapshots: this.domSnapshots, navigatedUrls: this.navigatedUrls, score };
   }
 
+  // Browser context configured with Italian locale, Rome timezone, real Chrome
+  // user agent, and basic webdriver masking. Without these, Sky's CDN can flag
+  // the scanner as automation even when the source IP is allowlisted, because
+  // CDN bot detection inspects fingerprint, not just IP.
   private async createBrowserContext(browser: any, opts: ScanOptions): Promise<any> {
-    return browser.newContext({
+    const context = await browser.newContext({
       viewport: { width: opts.viewport_width || 1366, height: opts.viewport_height || 768 },
       ignoreHTTPSErrors: true,
-      locale: "en-US",
+      locale: "it-IT",
+      timezoneId: "Europe/Rome",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      extraHTTPHeaders: {
+        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+      },
+      colorScheme: "light",
+    });
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      Object.defineProperty(navigator, "languages", { get: () => ["it-IT", "it", "en-US", "en"] });
+      Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, "platform", { get: () => "Win32" });
+    });
+    return context;
+  }
+
+  private attachScanDiagnostics(page: any): void {
+    page.on("framenavigated", (frame: any) => {
+      try {
+        if (frame === page.mainFrame()) {
+          const url = frame.url();
+          logger.info(`[SCAN-DIAG][NAV] ${url}`);
+          if (/gestisci|profile|account|profilo/i.test(url)) {
+            logger.warn(`[SCAN-DIAG][ACCOUNT-PAGE] Browser navigated to account/profile page: ${url}`);
+          }
+        }
+      } catch {}
     });
   }
 
-  private async handleLogin(page: any, auth: any, targetUrl?: string): Promise<string> {
+  private trackPageNavigations(page: any, context: string): void {
+    page.on("request", (request: any) => {
+      try {
+        if (request.isNavigationRequest?.() && request.resourceType?.() === "document" && request.frame?.() === page.mainFrame()) {
+          this.recordNavigatedUrl(request.url(), `${context} document request`);
+        }
+      } catch { /* ignore navigation observer errors */ }
+    });
+    page.on("framenavigated", (frame: any) => {
+      try {
+        if (frame === page.mainFrame()) {
+          this.recordNavigatedUrl(frame.url(), context);
+        }
+      } catch { /* ignore navigation observer errors */ }
+    });
+  }
+
+  private recordNavigatedUrl(rawUrl: string, context: string): void {
+    const url = String(rawUrl || "").trim();
+    if (!url || url === "about:blank") return;
+    const key = url;
+    if (this.navigatedUrlKeys.has(key)) { logger.info(`Scan revisited URL (${context}): ${url}`); return; }
+    this.navigatedUrlKeys.add(key);
+    this.navigatedUrls.push(url);
+    logger.info(`Scan navigated through URL (${context}): ${url}`);
+  }
+
+  private async navigateAndRecord(page: any, url: string, context: string): Promise<boolean> {
+    this.recordNavigatedUrl(url, `${context} requested`);
+    const ok = await navigateSafely(page, url);
+    this.recordNavigatedUrl(page.url(), `${context} reached`);
+    return ok;
+  }
+
+  private async handleLogin(page: any, auth: any): Promise<string> {
     try {
+      const isSkyWorkflow = auth?.workflow_type === "sky";
       const usernameSelector = this.authSelector(auth, "username_selector");
       const passwordSelector = this.authSelector(auth, "password_selector");
       const submitSelector = this.authSelector(auth, "submit_selector");
@@ -244,95 +329,111 @@ export class AccessibilityScanner {
       if (!passwordSelector) throw new Error("Password field selector is required for authenticated scans.");
       if (!submitSelector) throw new Error("Login submit selector is required for authenticated scans.");
 
-      const loginStartUrl = this.loginStartUrlForTarget(auth, targetUrl);
-      if (targetUrl && loginStartUrl !== auth.login_url) {
-        logger.info(`Starting authentication from target-aware URL so post-login returns to requested target: ${loginStartUrl}`);
-      }
-      await this.navigateAndRecord(page, loginStartUrl, "login");
-      await this.waitForSkyLoginReady(page);
+      await this.navigateAndRecord(page, auth.login_url, "login");
+      if (isSkyWorkflow) await this.waitForSkyLoginReady(page);
+      else await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => undefined);
       if (auth.auto_accept_cookies !== false) await this.waitAndClearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"), 12000);
-
-      if (!await this.hasVisibleAuthControl(page, usernameSelector)) {
-        const currentUrl = (() => {
-          try { return page.url(); } catch { return loginStartUrl; }
-        })();
-        if (await this.pageLooksAuthenticatedWithoutLoginForm(page, targetUrl || currentUrl)) {
-          logger.info(`No login form was found, but the browser appears to already be authenticated on ${currentUrl}; continuing scan.`);
-          return currentUrl;
-        }
-        const explicitLoginUrl = this.explicitLoginUrlForTarget(auth, targetUrl);
-        if (explicitLoginUrl && explicitLoginUrl !== currentUrl && explicitLoginUrl !== loginStartUrl) {
-          logger.info(`Login form was not found at ${currentUrl}; opening configured login URL directly: ${explicitLoginUrl}`);
-          await this.navigateAndRecord(page, explicitLoginUrl, "login fallback");
-          await this.waitForSkyLoginReady(page);
-          if (auth.auto_accept_cookies !== false) await this.waitAndClearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"), 12000);
-        }
-      }
       const loginUrl = page.url();
+      logger.info(`[LOGIN-DIAG] Login page loaded. URL: ${loginUrl}`);
 
       logger.info(`Using configured login selectors: username='${usernameSelector}', password='${passwordSelector}', submit='${submitSelector}'`);
 
-      const usernameFilled = await this.tryFillFirst(page, usernameSelector, auth.username || "", 30000);
+      const usernameFilled = await this.tryFillFirst(page, usernameSelector, auth.username || "", 12000);
       const usernameVerified = usernameFilled && await this.verifyFieldValue(page, usernameSelector, auth.username || "");
       if (!usernameVerified) {
         throw new Error(`Login username field was not found, was not filled, or did not retain the value with selector: ${usernameSelector}`);
       }
+      logger.info(`[LOGIN-DIAG] Username field filled and verified.`);
       this.onProgress(12, "SUCCESS: Username entered");
 
-      let passwordFilled = await this.tryFillFirst(page, passwordSelector, auth.password || "", 30000);
+      let passwordFilled = await this.tryFillFirst(page, passwordSelector, auth.password || "", 12000);
       let passwordVerified = passwordFilled && await this.verifyFieldValue(page, passwordSelector, auth.password || "");
 
       if (!passwordVerified) {
         throw new Error(`Login password field was not found, was not filled, or did not retain the value with selector: ${passwordSelector}`);
       }
+      logger.info(`[LOGIN-DIAG] Password field filled and verified.`);
       this.onProgress(16, "SUCCESS: Password entered");
 
-      if (auth.auto_accept_cookies !== false) await this.waitAndClearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"), 8000);
-      const readyToSubmit = await this.verifyFieldValue(page, usernameSelector, auth.username || "") && await this.verifyFieldValue(page, passwordSelector, auth.password || "");
+      if (auth.auto_accept_cookies !== false) {
+        await this.waitAndClearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"), 8000);
+      }
+
+      const readyToSubmit =
+        await this.verifyFieldValue(page, usernameSelector, auth.username || "") &&
+        await this.verifyFieldValue(page, passwordSelector, auth.password || "");
+
       if (!readyToSubmit) {
         throw new Error("Refusing to click Accedi because username/password are not both verified immediately before submit.");
       }
-      const submittedPassword = await this.tryClickFirst(page, submitSelector);
-      if (!submittedPassword) await page.keyboard.press("Enter").catch(() => undefined);
-      await this.waitForLoginTransition(page, auth, loginUrl, 20000);
+
+      this.attachLoginNetworkDiagnostics(page);
+
+      logger.info(`[LOGIN-DIAG] Before Accedi click URL: ${page.url()}`);
+      const errorBeforeClick = await this.getVisibleLoginError(page);
+      logger.info(`[LOGIN-PROOF] Before Accedi click: url=${page.url()}, visibleLoginError=${errorBeforeClick || "none"}`);
+      await this.captureLoginProofSnapshot(page, "before-accedi-click", errorBeforeClick);
+
+      logger.info(`[LOGIN-DIAG] Clicking configured Accedi submit control.`);
+      const clickStartedAt = Date.now();
+      const submitMethod = await this.submitLoginWithFallbacks(page, auth, loginUrl, submitSelector, passwordSelector);
+      logger.info(`[LOGIN-DIAG] Accedi activation result: ${submitMethod}`);
+      this.logLoginNetworkSummary("after Accedi activation");
+
+      this.onProgress(17, "SUCCESS: Accedi clicked");
+      await this.waitForLoginTransition(page, auth, loginUrl, Math.max(12000, Number(auth.post_login_wait_ms || 0)));
+
+      const loginError = await this.getVisibleLoginError(page);
+      logger.info(`[LOGIN-PROOF] After Accedi click + ${Date.now() - clickStartedAt}ms: url=${page.url()}, visibleLoginError=${loginError || "none"}`);
+      await this.captureLoginProofSnapshot(page, "after-accedi-click", loginError);
+      this.logLoginNetworkSummary("after Accedi transition wait");
+      if (loginError) {
+        throw new Error(`Sky rejected the login after Accedi: ${loginError}`);
+      }
+
+      const urlAfterSubmit = page.url();
+      logger.info(`[LOGIN-DIAG] After Accedi transition wait. URL: ${urlAfterSubmit} (changed: ${urlAfterSubmit !== loginUrl ? "YES" : "NO"})`);
       if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
 
       const otpSelector = this.authSelector(auth, "otp_selector");
       const otpSubmitSelector = this.authSelector(auth, "otp_submit_selector");
-      await this.waitForOtpPage(page, auth, 30000);
-      const otpValue = await this.resolveOtpValue(page, auth, 30000);
-      const otpControlVisible = await this.hasVisibleAuthControl(page, otpSelector);
-      if (otpSelector && otpControlVisible && !otpValue) {
-        throw new Error("OTP input is visible, but no OTP value could be resolved from the configured page selector or manual OTP code.");
-      }
-      if (otpSelector && otpValue) {
-        try {
-          await this.fillOtpInputs(page, otpSelector, otpValue, Math.min(auth.post_login_wait_ms || 8000, 15000));
-          const otpVerified = await this.verifyOtpInputs(page, otpSelector, otpValue);
-          if (!otpVerified) throw new Error("OTP fields did not retain all expected digits.");
-          this.onProgress(18, "SUCCESS: OTP entered");
-          if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
-          if (otpSubmitSelector) await this.clickFirst(page, otpSubmitSelector);
-          else {
-            const submittedOtp = await this.tryClickFirst(page, submitSelector);
-            if (!submittedOtp) await page.keyboard.press("Enter").catch(() => undefined);
+      const shouldHandleOtp = isSkyWorkflow || Boolean(auth.otp_code) || Boolean(auth.otp_from_page && this.authSelector(auth, "otp_source_selector")) || Boolean(otpSelector && otpSubmitSelector);
+      if (shouldHandleOtp) {
+        await this.waitForOtpPage(page, auth, isSkyWorkflow ? 30000 : 10000);
+        const otpValue = await this.resolveOtpValue(page, auth, isSkyWorkflow ? 30000 : 10000);
+        const otpControlVisible = await this.hasVisibleAuthControl(page, otpSelector);
+        if (otpSelector && otpControlVisible && !otpValue) {
+          throw new Error("OTP input is visible, but no OTP value could be resolved from the configured page selector or manual OTP code.");
+        }
+        if (otpSelector && otpValue) {
+          try {
+            await this.fillOtpInputs(page, otpSelector, otpValue, Math.min(auth.post_login_wait_ms || 8000, 15000));
+            const otpVerified = await this.verifyOtpInputs(page, otpSelector, otpValue);
+            if (!otpVerified) throw new Error("OTP fields did not retain all expected digits.");
+            this.onProgress(18, "SUCCESS: OTP entered");
+            if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
+            if (otpSubmitSelector) await this.clickFirst(page, otpSubmitSelector);
+            else {
+              const submittedOtp = await this.tryClickFirst(page, submitSelector);
+              if (!submittedOtp) await page.keyboard.press("Enter").catch(() => undefined);
+            }
+            this.onProgress(20, "SUCCESS: OTP confirmed");
+            await this.waitForLoginTransition(page, auth, loginUrl, 5000);
+          } catch (otpErr) {
+            throw new Error(`OTP field was configured but could not be completed: ${(otpErr as Error)?.message || otpErr}`);
           }
-          this.onProgress(20, "SUCCESS: Conferma clicked");
-          await this.waitForLoginTransition(page, auth, loginUrl, 20000);
-        } catch (otpErr) {
-          throw new Error(`OTP field was configured but could not be completed: ${(otpErr as Error)?.message || otpErr}`);
         }
       }
 
       await this.waitForPostLoginReady(page, auth, loginUrl);
       if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
-      await this.waitForAuthControlsToDisappear(page, auth, 60000);
-      if (await this.hasVisibleAuthControl(page, passwordSelector) || await this.hasVisibleAuthControl(page, otpSelector)) {
+      if (await this.hasVisibleAuthControl(page, passwordSelector) || (shouldHandleOtp && await this.hasVisibleAuthControl(page, otpSelector))) {
         throw new Error("Login did not complete; password or OTP controls are still visible.");
       }
       await this.ensureAuthenticatedPage(page, auth, page.url());
       return page.url();
     } catch (err) {
+      this.logLoginNetworkSummary("login failure catch");
       logger.warn("Login failed; scan will not continue with the login page:", err);
       throw err;
     }
@@ -343,14 +444,40 @@ export class AccessibilityScanner {
     const loginUrl = String(auth.login_url || "");
     const successPattern = String(auth.success_url_pattern || "").trim();
 
-    if (/\/login|signin|sign-in|auth/i.test(currentUrl) && !successPattern) {
-      logger.warn(`Authenticated URL still looks like an auth URL; validating by visible controls instead: ${currentUrl}`);
-    }
-    if (successPattern && !currentUrl.includes(successPattern)) {
-      logger.warn(`Authenticated URL does not contain configured success pattern '${successPattern}': ${currentUrl}`);
-    }
-    if (await this.hasVisibleAuthControl(page, this.authSelector(auth, "password_selector")) || await this.hasVisibleAuthControl(page, this.authSelector(auth, "otp_selector"))) {
+    logger.info(`[AUTH-VERIFY] Current URL: ${currentUrl}`);
+
+    const cookies = await page.context().cookies().catch(() => []);
+    logger.info(
+      `[AUTH-VERIFY] Cookies: ${cookies.map((c: any) => `${c.name}@${c.domain}`).join(", ")}`
+    );
+
+    if (await this.hasVisibleAuthControl(page, this.authSelector(auth, "password_selector")) ||
+        await this.hasVisibleAuthControl(page, this.authSelector(auth, "otp_selector"))) {
+      this.logLoginNetworkSummary("authenticated page validation failed");
       throw new Error(`Authentication failed; login controls are still visible on ${currentUrl}.`);
+    }
+
+    if (successPattern) {
+      if (!currentUrl.includes(successPattern)) {
+        throw new Error(
+          `Authentication completed but success URL pattern '${successPattern}' was not reached. Current URL: ${currentUrl}`
+        );
+      }
+      return;
+    }
+
+    if (/security|verify-enrollment|mfa/i.test(currentUrl)) {
+      throw new Error(
+        `Authentication appears incomplete. Browser is still on MFA/Security flow: ${currentUrl}`
+      );
+    }
+
+    if (/\/login|signin|sign-in|auth/i.test(currentUrl) &&
+        !this.sameUrlWithoutHash(currentUrl, expectedUrl) &&
+        !this.sameUrlWithoutHash(currentUrl, loginUrl)) {
+      throw new Error(
+        `Authentication appears incomplete. Current URL still resembles an authentication page: ${currentUrl}`
+      );
     }
   }
 
@@ -366,18 +493,365 @@ export class AccessibilityScanner {
     }
   }
 
-  private async waitForLoginTransition(page: any, auth: any, loginUrl: string, timeout = 20000): Promise<void> {
+  private async waitForLoginTransition(page: any, auth: any, loginUrl: string, timeout = 5000): Promise<void> {
     await Promise.race([
       page.waitForURL((url: URL) => url.href !== loginUrl, { timeout }).catch(() => undefined),
-      page.waitForLoadState("domcontentloaded", { timeout }).catch(() => undefined),
+      page.waitForLoadState("networkidle", { timeout }).catch(() => undefined),
       page.waitForTimeout(timeout)
     ]);
+    await page.waitForTimeout(1800).catch(() => undefined);
     await page.waitForLoadState("load", { timeout: 5000 }).catch(() => undefined);
+  }
+
+  private async submitLoginWithFallbacks(
+    page: any,
+    auth: any,
+    loginUrl: string,
+    submitSelector: string,
+    passwordSelector: string
+  ): Promise<string> {
+    const attempts: Array<{ name: string; run: () => Promise<boolean> }> = [
+      {
+        name: "selector click",
+        run: () => this.tryClickFirst(page, submitSelector),
+      },
+      {
+        name: "visible text click",
+        run: () => this.clickByVisibleText(page, "Accedi"),
+      },
+      {
+        name: "DOM form requestSubmit",
+        run: () => this.requestSubmitLoginForm(page, submitSelector),
+      },
+      {
+        name: "password Enter key",
+        run: async () => {
+          const focused = await this.focusFirstAuthControl(page, passwordSelector);
+          if (!focused) return false;
+          await page.keyboard.press("Enter").catch(() => undefined);
+          return true;
+        },
+      },
+    ];
+
+    for (const attempt of attempts) {
+      const beforeUrl = page.url();
+      logger.info(`[LOGIN-DIAG] Trying Accedi activation via ${attempt.name}.`);
+      const activated = await attempt.run().catch((err: any) => {
+        logger.info(`[LOGIN-DIAG] ${attempt.name} failed before activation: ${err?.message || err}`);
+        return false;
+      });
+      if (!activated) continue;
+
+      const signalTimeout = attempt.name === "selector click"
+        ? Math.max(15000, Number(auth.post_login_wait_ms || 0))
+        : 5000;
+      await this.waitForLoginAttemptSignal(page, auth, loginUrl, beforeUrl, signalTimeout);
+      const signal = await this.describeLoginAttemptSignal(page, auth, loginUrl, beforeUrl);
+      logger.info(`[LOGIN-DIAG] ${attempt.name} post-activation signal: ${signal}`);
+      if (signal !== "no visible state change") return `${attempt.name}; ${signal}`;
+    }
+
+    this.logLoginNetworkSummary("before Accedi fallback failure");
+    throw new Error(`Accedi submit control did not produce a login state change after selector, text, DOM submit, and Enter-key attempts. Selector: ${submitSelector}`);
+  }
+
+  private async waitForLoginAttemptSignal(page: any, auth: any, loginUrl: string, beforeUrl: string, timeout = 4500): Promise<void> {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const signal = await this.describeLoginAttemptSignal(page, auth, loginUrl, beforeUrl);
+      if (signal !== "no visible state change") return;
+      await page.waitForLoadState("domcontentloaded", { timeout: 500 }).catch(() => undefined);
+      await page.waitForTimeout(500).catch(() => undefined);
+    }
+  }
+
+  private async describeLoginAttemptSignal(page: any, auth: any, loginUrl: string, beforeUrl: string): Promise<string> {
+    const currentUrl = page.url();
+    const loginError = await this.getVisibleLoginError(page);
+    if (loginError) return `login error displayed: ${loginError}`;
+    if (currentUrl !== beforeUrl || currentUrl !== loginUrl) return `URL changed to ${currentUrl}`;
+    if (await this.hasVisibleAuthControl(page, this.authSelector(auth, "otp_selector")).catch(() => false)) return "OTP control visible";
+    if (!await this.hasVisibleAuthControl(page, this.authSelector(auth, "password_selector")).catch(() => true)) return "password control disappeared";
+    return "no visible state change";
+  }
+
+  private async focusFirstAuthControl(page: any, selectorList?: string): Promise<boolean> {
+    for (const root of this.locatorRoots(page)) {
+      for (const selector of this.selectorCandidates(selectorList)) {
+        try {
+          const locator = root.locator(selector).first();
+          if (await locator.isVisible({ timeout: 1000 }).catch(() => false)) {
+            await locator.focus({ timeout: 1000 }).catch(async () => {
+              await locator.click({ timeout: 1000 });
+            });
+            return true;
+          }
+        } catch { /* try deep focus */ }
+        try {
+          const focused = await root.evaluate((selector: string) => {
+            const find = (container: Document | ShadowRoot | Element): HTMLElement | null => {
+              const direct = (container as Document | ShadowRoot | Element).querySelector?.(selector) as HTMLElement | null;
+              if (direct) return direct;
+              for (const child of Array.from((container as Document | ShadowRoot | Element).querySelectorAll?.("*") || [])) {
+                const shadow = (child as HTMLElement).shadowRoot;
+                if (!shadow) continue;
+                const found = find(shadow);
+                if (found) return found;
+              }
+              return null;
+            };
+            const el = find(document);
+            if (!el) return false;
+            el.focus();
+            return document.activeElement === el || (el.getRootNode() as ShadowRoot).activeElement === el;
+          }, selector).catch(() => false);
+          if (focused) return true;
+        } catch { /* try next selector */ }
+      }
+    }
+    return false;
+  }
+
+  private async requestSubmitLoginForm(page: any, submitSelector?: string): Promise<boolean> {
+    for (const root of this.locatorRoots(page)) {
+      for (const selector of this.selectorCandidates(submitSelector)) {
+        const submitted = await root.evaluate((selector: string) => {
+          const queryDeep = (container: Document | ShadowRoot | Element, selector: string): HTMLElement | null => {
+            if (selector.startsWith("js=")) {
+              try {
+                const el = Function(`"use strict"; return (${selector.slice(3)});`)();
+                return el instanceof HTMLElement ? el : null;
+              } catch {
+                return null;
+              }
+            }
+            try {
+              const direct = (container as Document | ShadowRoot | Element).querySelector(selector) as HTMLElement | null;
+              if (direct) return direct;
+            } catch {
+              return null;
+            }
+            for (const child of Array.from((container as Document | ShadowRoot | Element).querySelectorAll?.("*") || [])) {
+              const shadow = (child as HTMLElement).shadowRoot;
+              if (!shadow) continue;
+              const found = queryDeep(shadow, selector);
+              if (found) return found;
+            }
+            return null;
+          };
+          const submitter = queryDeep(document, selector);
+          const form = submitter?.closest("form") as HTMLFormElement | null;
+          if (!form) return false;
+          if (typeof form.requestSubmit === "function") form.requestSubmit(submitter as HTMLButtonElement);
+          else form.submit();
+          return true;
+        }, selector).catch(() => false);
+        if (submitted) return true;
+      }
+    }
+    return false;
+  }
+
+  private attachLoginNetworkDiagnostics(page: any): void {
+    this.loginNetworkDiagnostics = {
+      clientAuthorizeHit: false,
+      userLoginHit: false,
+      importantIncidents: [],
+    };
+    this.importantNetworkPending.clear();
+
+    page.on("request", (request: any) => {
+      const url = request.url();
+      if (/cronus|login|auth|otp|skyid/i.test(url)) {
+        logger.info(`[LOGIN-NET][REQ] ${request.method()} ${url}`);
+      }
+      if (this.isImportantAuthNetworkUrl(url)) {
+        this.importantNetworkPending.set(request, { method: request.method(), url, startedAt: Date.now() });
+      }
+      if (this.isCronusClientAuthorize(url)) {
+        this.loginNetworkDiagnostics.clientAuthorizeHit = true;
+        logger.info(`[LOGIN-NET][CLIENT-AUTHORIZE][REQ] method=${request.method()} url=${url}`);
+      }
+      if (this.isCronusUserLogin(url)) {
+        this.loginNetworkDiagnostics.userLoginHit = true;
+        logger.info(`[LOGIN-NET][USER-LOGIN][REQ] method=${request.method()} url=${url}`);
+      }
+    });
+
+    page.on("response", async (response: any) => {
+      const url = response.url();
+      const status = response.status();
+      const request = response.request?.();
+      const pending = request ? this.importantNetworkPending.get(request) : undefined;
+      if (request) this.importantNetworkPending.delete(request);
+      if (/cronus|login|auth|otp|skyid/i.test(url)) {
+        logger.info(`[LOGIN-NET][RES] ${status} ${url}`);
+      }
+      if (this.isImportantAuthNetworkUrl(url) && status >= 400) {
+        const preview = await this.safeResponsePreview(response);
+        const elapsed = pending ? `${Date.now() - pending.startedAt}ms` : "unknown";
+        const incident = `${response.request?.().method?.() || pending?.method || "?"} ${url} -> HTTP ${status} after ${elapsed}${preview ? ` body=${preview}` : ""}`;
+        this.rememberImportantNetworkIncident(incident);
+        logger.warn(`[LOGIN-NET][IMPORTANT][HTTP-ERROR] ${incident}`);
+      }
+      if (this.isCronusClientAuthorize(url)) {
+        this.loginNetworkDiagnostics.clientAuthorizeHit = true;
+        this.loginNetworkDiagnostics.clientAuthorizeStatus = status;
+        if (!response.ok()) this.loginNetworkDiagnostics.clientAuthorizeFailure = `HTTP ${status}`;
+        logger.info(`[LOGIN-NET][CLIENT-AUTHORIZE][RES] status=${status} ok=${response.ok()} url=${url}`);
+      }
+      if (this.isCronusUserLogin(url)) {
+        this.loginNetworkDiagnostics.userLoginHit = true;
+        this.loginNetworkDiagnostics.userLoginStatus = status;
+        if (!response.ok()) this.loginNetworkDiagnostics.userLoginFailure = `HTTP ${status}`;
+        const preview = !response.ok() ? await this.safeResponsePreview(response) : "";
+        if (preview) this.loginNetworkDiagnostics.userLoginPreview = preview;
+        logger.info(`[LOGIN-NET][USER-LOGIN][RES] status=${status} ok=${response.ok()}${preview ? ` body=${preview}` : ""} url=${url}`);
+      }
+    });
+
+    page.on("requestfailed", (request: any) => {
+      const url = request.url();
+      const failure = request.failure?.()?.errorText || "unknown failure";
+      const pending = this.importantNetworkPending.get(request);
+      this.importantNetworkPending.delete(request);
+      if (/cronus|login|auth|otp|skyid/i.test(url)) {
+        logger.warn(`[LOGIN-NET][REQ-FAILED] ${request.method()} ${url} failure=${failure}`);
+      }
+      if (this.isImportantAuthNetworkUrl(url)) {
+        const elapsed = pending ? `${Date.now() - pending.startedAt}ms` : "unknown";
+        const incident = `${request.method()} ${url} failed after ${elapsed}: ${failure}`;
+        this.rememberImportantNetworkIncident(incident);
+        logger.warn(`[LOGIN-NET][IMPORTANT][REQ-FAILED] ${incident}`);
+      }
+      if (this.isCronusClientAuthorize(url)) {
+        this.loginNetworkDiagnostics.clientAuthorizeHit = true;
+        this.loginNetworkDiagnostics.clientAuthorizeFailure = failure;
+        logger.warn(`[LOGIN-NET][CLIENT-AUTHORIZE][REQ-FAILED] failure=${failure} url=${url}`);
+      }
+      if (this.isCronusUserLogin(url)) {
+        this.loginNetworkDiagnostics.userLoginHit = true;
+        this.loginNetworkDiagnostics.userLoginFailure = failure;
+        logger.warn(`[LOGIN-NET][USER-LOGIN][REQ-FAILED] failure=${failure} url=${url}`);
+      }
+    });
+  }
+
+  private isImportantAuthNetworkUrl(url: string): boolean {
+    return /test\.cerebro-platform\.sky\.it|test-www\.sky\.it|test\.abbonamento\.sky\.it|\/cronus\/|\/otp\b|\/login\b|\/auth\b|\/authorize\b|\/token\b|skyid/i.test(url);
+  }
+
+  private isCronusClientAuthorize(url: string): boolean {
+    return /\/cronus\/v2\/client\/authorize\b/i.test(url);
+  }
+
+  private isCronusUserLogin(url: string): boolean {
+    return /\/cronus\/v2\/user\/login\b/i.test(url);
+  }
+
+  private async safeResponsePreview(response: any): Promise<string> {
+    try {
+      const contentType = String(response.headers?.()["content-type"] || "");
+      if (!/json|text|html|plain/i.test(contentType)) return `content-type=${contentType || "unknown"}`;
+      const text = await response.text();
+      return this.sanitizeNetworkBody(text).slice(0, 800);
+    } catch (err) {
+      return `body unavailable: ${(err as Error)?.message || err}`;
+    }
+  }
+
+  private sanitizeNetworkBody(value: string): string {
+    return String(value || "")
+      .replace(/("?(?:access_token|refresh_token|id_token|token|password|authorization)"?\s*[:=]\s*)"[^"]+"/gi, "$1\"[redacted]\"")
+      .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[redacted]")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  private rememberImportantNetworkIncident(incident: string): void {
+    const list = this.loginNetworkDiagnostics.importantIncidents;
+    if (list.includes(incident)) return;
+    list.push(incident);
+    if (list.length > 12) list.shift();
+  }
+
+  private logLoginNetworkSummary(context: string): void {
+    const diag = this.loginNetworkDiagnostics;
+    const pending = [...this.importantNetworkPending.values()]
+      .filter(item => this.isImportantAuthNetworkUrl(item.url))
+      .slice(-8)
+      .map(item => `${item.method} ${item.url} pending ${Date.now() - item.startedAt}ms`);
+    logger.info(
+      `[LOGIN-NET][SUMMARY] ${context}: ` +
+      `clientAuthorizeHit=${diag.clientAuthorizeHit ? "YES" : "NO"}` +
+      `${typeof diag.clientAuthorizeStatus === "number" ? ` clientAuthorizeStatus=${diag.clientAuthorizeStatus}` : ""}` +
+      `${diag.clientAuthorizeFailure ? ` clientAuthorizeFailure=${diag.clientAuthorizeFailure}` : ""}; ` +
+      `userLoginHit=${diag.userLoginHit ? "YES" : "NO"}` +
+      `${typeof diag.userLoginStatus === "number" ? ` userLoginStatus=${diag.userLoginStatus}` : ""}` +
+      `${diag.userLoginFailure ? ` userLoginFailure=${diag.userLoginFailure}` : ""}` +
+      `${diag.userLoginPreview ? ` userLoginBody=${diag.userLoginPreview}` : ""}` +
+      `${diag.importantIncidents.length ? `; importantFailures=${diag.importantIncidents.join(" || ")}` : ""}` +
+      `${pending.length ? `; pendingImportantRequests=${pending.join(" || ")}` : ""}`
+    );
+  }
+
+  private async captureLoginProofSnapshot(page: any, phase: string, visibleError?: string | null): Promise<void> {
+    try {
+      const buf = await page.screenshot({ type: "jpeg", quality: 68, fullPage: false });
+      this.domSnapshots.push({
+        url: page.url(),
+        phase,
+        state: phase,
+        a11yTree: {
+          proof: "Accedi click diagnostic",
+          visibleLoginError: visibleError || null,
+          capturedAt: new Date().toISOString(),
+        },
+        screenshot: `data:image/jpeg;base64,${buf.toString("base64")}`,
+      });
+      logger.info(`[LOGIN-PROOF] Screenshot captured for ${phase} (${Math.round(buf.length / 1024)}KB).`);
+    } catch (err) {
+      logger.warn(`[LOGIN-PROOF] Screenshot capture failed for ${phase}: ${(err as Error)?.message || err}`);
+    }
+  }
+
+  private async getVisibleLoginError(page: any): Promise<string | null> {
+    return page.evaluate(() => {
+      const errorPattern = /si e verificato un problema durante l'accesso|si e verificato un problema durante l.accesso|problema durante l.accesso|contatta il servizio clienti sky|password errata|password non corretta|email non valida|credenziali non valide|troppe richieste|account bloccato|account sospeso|servizio non disponibile|sessione scaduta|invalid credentials|wrong password|too many attempts|account locked/i;
+      const normalize = (value: string) =>
+        String(value || "")
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+      const isVisible = (el: Element) => {
+        const rect = (el as HTMLElement).getBoundingClientRect();
+        const style = window.getComputedStyle(el as HTMLElement);
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+      };
+      const collectElements = (container: Document | ShadowRoot | Element): Element[] => {
+        const direct = Array.from((container as Document | ShadowRoot | Element).querySelectorAll?.("*") || []);
+        const nested = direct.flatMap(child => (child as HTMLElement).shadowRoot ? collectElements((child as HTMLElement).shadowRoot!) : []);
+        return [...direct, ...nested];
+      };
+
+      const candidates = collectElements(document)
+        .filter(isVisible)
+        .map(el => normalize((el as HTMLElement).innerText || el.textContent || ""))
+        .filter(Boolean);
+
+      const match = candidates.find(text => errorPattern.test(text));
+      if (!match) return null;
+      const found = match.match(errorPattern)?.[0] || match;
+      const idx = match.toLowerCase().indexOf(found.toLowerCase());
+      return match.substring(Math.max(0, idx - 80), Math.min(match.length, idx + 180));
+    }).catch(() => null);
   }
 
   private async waitForPostLoginReady(page: any, auth: any, loginUrl: string): Promise<void> {
     const requestedWait = Number(auth.post_login_wait_ms || 0);
-    const timeout = Math.max(30000, Math.min(requestedWait || 30000, 90000));
+    const timeout = Math.max(15000, Math.min(requestedWait || 15000, 45000));
     const successPattern = String(auth.success_url_pattern || "").trim();
 
     if (successPattern) {
@@ -416,58 +890,10 @@ export class AccessibilityScanner {
       ]);
     }
 
-    await page.waitForLoadState("domcontentloaded", { timeout: 20000 }).catch(() => undefined);
-    await page.waitForLoadState("load", { timeout: 20000 }).catch(() => undefined);
-    await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => undefined);
+    await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => undefined);
+    await page.waitForLoadState("load", { timeout: 10000 }).catch(() => undefined);
+    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => undefined);
     await page.waitForTimeout(Math.max(1500, Math.min(requestedWait || 2000, 5000)));
-  }
-
-  private async waitForAuthControlsToDisappear(page: any, auth: any, timeout = 60000): Promise<void> {
-    const passwordSelector = this.authSelector(auth, "password_selector");
-    const otpSelector = this.authSelector(auth, "otp_selector");
-    const deadline = Date.now() + timeout;
-    while (Date.now() < deadline) {
-      const passwordVisible = await this.hasVisibleAuthControl(page, passwordSelector).catch(() => false);
-      const otpVisible = await this.hasVisibleAuthControl(page, otpSelector).catch(() => false);
-      const currentUrl = (() => {
-        try { return page.url(); } catch { return ""; }
-      })();
-      if (!passwordVisible && !otpVisible && !/\/login|\/security|signin|sign-in|auth/i.test(currentUrl)) return;
-      await page.waitForLoadState("domcontentloaded", { timeout: 1500 }).catch(() => undefined);
-      await page.waitForTimeout(1000).catch(() => undefined);
-    }
-  }
-
-  private addScanRunFailureIssue(url: string, err: unknown): void {
-    const message = (err as Error)?.message || String(err || "scan failed");
-    const isAuthFailure = /login|authentication|password|otp|username|auth/i.test(message);
-    this.allIssues.push({
-      ruleId: isAuthFailure ? "authenticated-scan-not-completed" : "scan-run-not-completed",
-      severity: "serious",
-      category: isAuthFailure ? "authentication-coverage" : "scan-coverage",
-      message: isAuthFailure
-        ? `The authenticated scan could not continue because login did not complete: ${message}`
-        : `The scan could not complete for the configured URL: ${message}`,
-      url,
-      selector: "document",
-      tags: ["scan-coverage", "advisory"],
-      fixSuggestion: isAuthFailure
-        ? "Verify the supplied credentials, OTP source/manual OTP value, login selectors, MFA timing, and whether the security page is waiting for user action."
-        : "Check whether the page is reachable, whether the scanner can load it, and whether any configured journey selector blocked execution.",
-      evidenceExplanation: `Scan stopped before the requested page could be tested. Error: ${message}`
-    });
-    this.testCases.push({
-      name: isAuthFailure ? "Authenticated scan login gate" : "Scan execution gate",
-      description: isAuthFailure
-        ? "The scanner must complete login/MFA before testing authenticated pages."
-        : "The scanner must reach the requested page before running accessibility checks.",
-      category: "hybrid-review",
-      wcagRef: "Scan coverage",
-      status: "fail",
-      issueUrl: url,
-      steps: [`Start scan for ${url}.`, "Complete all required navigation/authentication gates.", "Run accessibility modules on the requested page."],
-      result: `Failed - ${message}`
-    });
   }
 
   private async waitForSkyLoginReady(page: any): Promise<void> {
@@ -495,53 +921,136 @@ export class AccessibilityScanner {
     await page.waitForTimeout(1500);
   }
 
-  private explicitLoginUrlForTarget(auth: any, targetUrl?: string): string {
-    const configuredLoginUrl = String(auth?.login_url || "").trim();
-    if (!configuredLoginUrl) return "";
-    if (!targetUrl) return configuredLoginUrl;
-    return this.rewriteLoginForwardTarget(configuredLoginUrl, targetUrl);
-  }
-
-  private async pageLooksAuthenticatedWithoutLoginForm(page: any, targetUrl: string): Promise<boolean> {
-    try {
-      const currentUrl = page.url();
-      if (/\/login|\/security|signin|sign-in|auth/i.test(currentUrl)) return false;
-      if (targetUrl) {
-        try {
-          const current = new URL(currentUrl);
-          const target = new URL(targetUrl);
-          if (current.hostname !== target.hostname) return false;
-        } catch {
-          // Continue with DOM signal checks.
-        }
-      }
-      return await page.evaluate(() => {
-        const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
-        const interactiveCount = document.querySelectorAll("a[href],button,input,select,textarea,[role='button'],[role='link'],[tabindex]").length;
-        const hasLoginText = /accedi|login|sign in|username|password|otp|codice/i.test(text);
-        return text.length > 80 && interactiveCount > 0 && !hasLoginText;
-      }).catch(() => false);
-    } catch {
-      return false;
-    }
-  }
-
+  // ── DIAGNOSTIC waitForOtpPage ─────────────────────────────────────────────
+  // Logs URL changes and page state every 5 polls; on timeout, captures a
+  // screenshot and lists visible controls + any Italian/English error message,
+  // so Azure failures are debuggable from log stream alone instead of guessing.
   private async waitForOtpPage(page: any, auth: any, timeout = 30000): Promise<void> {
     const otpSelector = this.authSelector(auth, "otp_selector");
     const otpSourceSelector = this.authSelector(auth, "otp_source_selector");
+    const passwordSelector = this.authSelector(auth, "password_selector");
     const deadline = Date.now() + timeout;
+
+    const startUrl = page.url();
+    logger.info(`[OTP-WAIT] Starting OTP detection. Current URL: ${startUrl}`);
+    logger.info(`[OTP-WAIT] OTP source selector: '${(otpSourceSelector || "").slice(0, 120)}'`);
+    logger.info(`[OTP-WAIT] OTP input selector:  '${(otpSelector || "").slice(0, 120)}'`);
+    logger.info(`[OTP-WAIT] otp_from_page: ${Boolean(auth?.otp_from_page)}, otp_code preset: ${Boolean(auth?.otp_code)}`);
+
+    let pollCount = 0;
     while (Date.now() < deadline) {
+      pollCount++;
       const hasOtpText = Boolean(await this.resolveOtpValue(page, auth, 1000).catch(() => ""));
       const hasOtpInput = await this.hasVisibleAuthControl(page, otpSelector).catch(() => false);
       const hasSource = await this.hasVisibleAuthControl(page, otpSourceSelector).catch(() => false);
+
       if (hasOtpText || hasOtpInput || hasSource) {
+        logger.info(`[OTP-WAIT] OTP page detected after ${pollCount} polls (~${Math.round(pollCount * 0.7)}s). otpText=${hasOtpText}, otpInput=${hasOtpInput}, otpSource=${hasSource}`);
         this.onProgress(17, "SUCCESS: OTP page detected");
         return;
       }
+
+      if (pollCount % 5 === 0) {
+        const currentUrl = page.url();
+        const passwordStillVisible = await this.hasVisibleAuthControl(page, passwordSelector).catch(() => false);
+        const cookieStillVisible = await this.hasCookieConsentPrompt(page).catch(() => false);
+        logger.info(`[OTP-WAIT] Poll ${pollCount}: URL=${currentUrl}, passwordVisible=${passwordStillVisible}, cookieVisible=${cookieStillVisible}, otpInput=${hasOtpInput}, otpSource=${hasSource}`);
+      }
+
       await page.waitForLoadState("domcontentloaded", { timeout: 1000 }).catch(() => undefined);
       await page.waitForTimeout(700);
     }
-    throw new Error("OTP page did not appear after clicking Accedi.");
+
+    const failureUrl = page.url();
+    const passwordStillVisible = await this.hasVisibleAuthControl(page, passwordSelector).catch(() => false);
+    const cookieStillVisible = await this.hasCookieConsentPrompt(page).catch(() => false);
+
+    const errorMessage: string | null = await page.evaluate(() => {
+      const errorPatterns = /password errata|password non corretta|email non valida|account bloccato|account sospeso|credenziali non valide|troppe richieste|too many attempts|account locked|invalid credentials|wrong password|incorrect|errore|riprova|non riusciamo|servizio non disponibile|qualcosa è andato storto|sessione scaduta/i;
+      const collectText = (container: Document | ShadowRoot | Element): string => {
+        const ownText = container instanceof Document
+          ? (container.body?.innerText || container.body?.textContent || "")
+          : ((container as HTMLElement).innerText || (container as Element).textContent || "");
+        let shadowText = "";
+        try {
+          const children = Array.from((container as Document | ShadowRoot | Element).querySelectorAll?.("*") || []);
+          shadowText = children
+            .map(child => (child as HTMLElement).shadowRoot ? collectText((child as HTMLElement).shadowRoot!) : "")
+            .join(" ");
+        } catch { /* ignore */ }
+        return `${ownText} ${shadowText}`;
+      };
+      const allText = collectText(document);
+      const match = allText.match(errorPatterns);
+      if (!match) return null;
+      const idx = allText.toLowerCase().indexOf(match[0].toLowerCase());
+      return allText.substring(Math.max(0, idx - 80), Math.min(allText.length, idx + 160)).replace(/\s+/g, " ").trim();
+    }).catch(() => null);
+
+    const visibleControls: string[] = await page.evaluate(() => {
+      const isVisible = (el: Element) => {
+        const rect = (el as HTMLElement).getBoundingClientRect();
+        const style = window.getComputedStyle(el as HTMLElement);
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+      };
+      const collect = (container: Document | ShadowRoot | Element): Element[] => {
+        const direct = Array.from((container as Document | ShadowRoot | Element).querySelectorAll("button,[role='button'],input,a[href]"));
+        const nested = Array.from((container as Document | ShadowRoot | Element).querySelectorAll("*"))
+          .flatMap(child => (child as HTMLElement).shadowRoot ? collect((child as HTMLElement).shadowRoot!) : []);
+        return [...direct, ...nested];
+      };
+      return collect(document)
+        .filter(isVisible)
+        .map(el => {
+          const tag = el.tagName.toLowerCase();
+          const type = (el as HTMLInputElement).type || "";
+          const label = ((el as HTMLElement).innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("placeholder") || el.getAttribute("name") || "").replace(/\s+/g, " ").trim().slice(0, 50);
+          return `${tag}${type ? `[type=${type}]` : ""}${label ? `: "${label}"` : ""}`;
+        })
+        .slice(0, 15);
+    }).catch(() => []);
+
+    let screenshotInfo = "screenshot capture failed";
+    try {
+      const buf = await page.screenshot({ type: "jpeg", quality: 60, fullPage: false });
+      screenshotInfo = `screenshot captured (${Math.round(buf.length / 1024)}KB) — visible in Live DOM / UI States tab as 'otp-failure-diagnostic'`;
+      this.domSnapshots.push({
+        url: failureUrl,
+        phase: "otp-failure-diagnostic",
+        state: "otp-failure-diagnostic",
+        a11yTree: null,
+        screenshot: `data:image/jpeg;base64,${buf.toString("base64")}`,
+      });
+    } catch (err) {
+      logger.debug(`Failure screenshot capture failed: ${(err as Error).message}`);
+    }
+
+    logger.error(`[OTP-WAIT] ============================================================`);
+    logger.error(`[OTP-WAIT] OTP detection FAILED after ${pollCount} polls (${timeout}ms).`);
+    logger.error(`[OTP-WAIT]   Start URL:    ${startUrl}`);
+    logger.error(`[OTP-WAIT]   Failure URL:  ${failureUrl}`);
+    logger.error(`[OTP-WAIT]   URL changed:  ${startUrl !== failureUrl ? "YES" : "NO — login likely never submitted or rejected immediately"}`);
+    logger.error(`[OTP-WAIT]   Password field still visible: ${passwordStillVisible ? "YES — login form did not advance" : "NO"}`);
+    logger.error(`[OTP-WAIT]   Cookie banner still visible:  ${cookieStillVisible ? "YES — banner may have blocked submission" : "NO"}`);
+    logger.error(`[OTP-WAIT]   Error message detected:       ${errorMessage || "none"}`);
+    logger.error(`[OTP-WAIT]   Visible controls on page:    ${visibleControls.length ? visibleControls.join(" | ") : "none captured"}`);
+    logger.error(`[OTP-WAIT]   ${screenshotInfo}`);
+    logger.error(`[OTP-WAIT] ============================================================`);
+
+    let diagnosticHint = "";
+    if (errorMessage) {
+      diagnosticHint = ` — Page shows error: "${errorMessage}"`;
+    } else if (passwordStillVisible) {
+      diagnosticHint = " — Password field is STILL visible after submit. Either the Accedi click did not fire OR the credentials were rejected silently by the CDN. Check the diagnostic screenshot.";
+    } else if (cookieStillVisible) {
+      diagnosticHint = " — Cookie banner is still visible and is likely blocking the OTP page from rendering. Check cookie_accept_selector configuration.";
+    } else if (startUrl === failureUrl) {
+      diagnosticHint = " — URL did not change after Accedi click. Form submission may have failed silently.";
+    } else {
+      diagnosticHint = ` — URL changed to ${failureUrl} but no OTP input/source was found. Either OTP selectors are outdated for the current Sky page structure, OR this account is not gated by OTP.`;
+    }
+
+    throw new Error(`OTP page did not appear after clicking Accedi.${diagnosticHint}`);
   }
 
   private selectorCandidates(selectorList?: string): string[] {
@@ -553,16 +1062,18 @@ export class AccessibilityScanner {
   }
 
   private authSelector(auth: any, key: string): string {
+    if (auth?.[key]) return String(auth[key]).trim();
+    if (auth?.workflow_type !== "sky") return "";
     const defaults: Record<string, string> = {
       cookie_accept_selector: "js=document.querySelector('#notice button.accbtn[aria-label=\"Accetta tutto\"]')\n//button[@title='Accetta tutto']\n//*[@id='notice']//button[@aria-label='Accetta tutto' or normalize-space()='Accetta tutto']",
       username_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-email')\n//input[@id='sky-login-email']\n#sky-login-email",
-      password_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('div.sky-login-label-password login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-password')\n//input[@id='sky-login-password']\n#sky-login-password",
+      password_selector: "js=document.querySelector('sky-login-component#sky-login')?.shadowRoot?.querySelector('login-input.sky-login-input')?.shadowRoot?.querySelector('#sky-login-password')\n//input[@id='sky-login-password']\n#sky-login-password",
       submit_selector: "js=document.querySelector('sky-login-component#sky-login button.sky-login-submit[type=\"submit\"]')\n//button[@class='sky-login-submit']\n//button[contains(@class,'sky-login-submit')]\nbutton.sky-login-submit[type='submit']",
       otp_source_selector: "div.otp-verify-sms-content > p",
       otp_selector: "input.otp-input_otp-input__QvpEl\ninput[aria-label^='Please enter OTP character'], input[name*='otp' i], div[role='textbox'], [contenteditable='true']",
       otp_submit_selector: "js=document.querySelector(\"button.sky-button-primary[aria-label='Conferma']\")\n//button[normalize-space()='Conferma']\n//button[@aria-label='Conferma' and contains(@class,'sky-button-primary')]\nbutton.sky-button-primary[aria-label='Conferma']",
     };
-    return String(auth?.[key] || defaults[key] || "").trim();
+    return String(defaults[key] || "").trim();
   }
 
   private locatorRoots(page: any): any[] {
@@ -631,18 +1142,11 @@ export class AccessibilityScanner {
   private async clickByVisibleText(page: any, label: string): Promise<boolean> {
     const escaped = this.escapeRegExp(label);
     const pattern = new RegExp(`^\\s*${escaped}\\s*$`, "i");
-    const relaxedPattern = new RegExp(
-      this.escapeRegExp(label).replace(/\\s+/g, "\\s+").replace(/[’']/g, "[’']"),
-      "i"
-    );
     for (const root of this.locatorRoots(page)) {
-      const bestInteractiveClick = await this.clickBestInteractiveByTextInRoot(root, label).catch(() => false);
-      if (bestInteractiveClick) return true;
       const locators = [
         root.getByRole?.("link", { name: pattern }).first(),
         root.getByRole?.("button", { name: pattern }).first(),
         root.getByText?.(pattern).first(),
-        root.getByText?.(relaxedPattern).first(),
       ].filter(Boolean);
       for (const locator of locators) {
         try {
@@ -656,321 +1160,6 @@ export class AccessibilityScanner {
       if (clicked) return true;
     }
     return false;
-  }
-
-  private loginStartUrlForTarget(auth: any, targetUrl?: string): string {
-    const configuredLoginUrl = String(auth?.login_url || "").trim();
-    const requestedTargetUrl = String(targetUrl || "").trim();
-    if (!configuredLoginUrl || !requestedTargetUrl) return configuredLoginUrl;
-
-    try {
-      const login = new URL(configuredLoginUrl);
-      const target = new URL(requestedTargetUrl);
-      const loginPath = login.pathname.toLowerCase();
-      const looksLikeLoginEntry = /\/login|\/security|signin|sign-in|auth/.test(loginPath) || login.hostname !== target.hostname;
-
-      if (!looksLikeLoginEntry) {
-        return requestedTargetUrl;
-      }
-
-      return this.rewriteLoginForwardTarget(configuredLoginUrl, requestedTargetUrl);
-    } catch {
-      return configuredLoginUrl;
-    }
-  }
-
-  private rewriteLoginForwardTarget(loginUrl: string, targetUrl: string): string {
-    try {
-      const parsed = new URL(loginUrl);
-      if (parsed.searchParams.has("forward")) {
-        parsed.searchParams.set("forward", targetUrl);
-        return parsed.toString();
-      }
-      if (/\/login|\/security|signin|sign-in|auth/i.test(parsed.pathname)) {
-        parsed.searchParams.set("forward", targetUrl);
-        return parsed.toString();
-      }
-      return loginUrl;
-    } catch {
-      return loginUrl;
-    }
-  }
-
-  private async openAuthenticatedTarget(
-    page: any,
-    auth: any,
-    targetUrl: string,
-    progress: (msg: string) => void
-  ): Promise<string | null> {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const suffix = attempt > 1 ? ` (retry ${attempt})` : "";
-      progress(`Navigating to authenticated target ${targetUrl}${suffix}`);
-      const ok = await this.navigateAndRecord(page, targetUrl, `authenticated target${suffix}`);
-      if (!ok) {
-        logger.warn(`Skipping unreachable URL: ${targetUrl}`);
-        return null;
-      }
-
-      if (auth?.auto_accept_cookies !== false) {
-        await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector")).catch(() => undefined);
-      }
-      const settledUrl = await this.waitForTargetUrlToSettle(page, targetUrl);
-      await this.ensureAuthenticatedPage(page, auth, targetUrl);
-      if (this.sameUrlWithoutHash(settledUrl, targetUrl)) {
-        return settledUrl;
-      }
-
-      this.recordNavigatedUrl(settledUrl, "authenticated target final URL after redirect");
-      logger.warn(`Authenticated target redirected from ${targetUrl} to ${settledUrl} on attempt ${attempt}.`);
-      const recoveredUrl = await this.recoverAuthenticatedTargetViaAppNavigation(page, auth, targetUrl, settledUrl, progress);
-      if (recoveredUrl) {
-        return recoveredUrl;
-      }
-      if (attempt < 2) {
-        progress(`WARN: Target moved from ${targetUrl} to ${settledUrl}; retrying requested target once`);
-        await page.waitForTimeout(1000).catch(() => undefined);
-      } else {
-        this.addTargetRedirectEvidence(targetUrl, settledUrl);
-        progress(`WARN: Authenticated target redirected from ${targetUrl} to ${settledUrl}; target was not scanned`);
-      }
-    }
-    return null;
-  }
-
-  private async recoverAuthenticatedTargetViaAppNavigation(
-    page: any,
-    auth: any,
-    targetUrl: string,
-    redirectedUrl: string,
-    progress: (msg: string) => void
-  ): Promise<string | null> {
-    const labels = this.inferNavigationLabelsForTarget(targetUrl);
-    if (!labels.length) return null;
-
-    progress(`Target redirected to ${redirectedUrl}; trying authenticated app navigation: ${labels.join(", ")}`);
-    for (const label of labels) {
-      const clicked = await this.clickByVisibleText(page, label).catch(() => false);
-      if (!clicked) continue;
-
-      await this.waitAfterTargetStep(page, auth, progress, `navigation recovery: ${label}`).catch(() => undefined);
-      this.recordNavigatedUrl(page.url(), `navigation recovery ${label}`);
-
-      const directAfterSection = await this.tryTargetAfterAppSection(page, auth, targetUrl, progress);
-      if (directAfterSection) return directAfterSection;
-
-      const clickedTarget = await this.clickBestTargetLinkForUrl(page, targetUrl).catch(() => false);
-      if (clickedTarget) {
-        await this.waitAfterTargetStep(page, auth, progress, `target recovery click: ${label}`).catch(() => undefined);
-        const settledUrl = await this.waitForTargetUrlToSettle(page, targetUrl, 12000);
-        this.recordNavigatedUrl(settledUrl, `target recovery final URL: ${label}`);
-        if (this.sameUrlWithoutHash(settledUrl, targetUrl)) return settledUrl;
-      }
-    }
-    return null;
-  }
-
-  private inferNavigationLabelsForTarget(targetUrl: string): string[] {
-    try {
-      const parsed = new URL(targetUrl);
-      const path = parsed.pathname.toLowerCase();
-      if (path.includes("/offers") || path.includes("/offerte")) {
-        return ["Offerte", "Offers"];
-      }
-      if (path.includes("/fatture") || path.includes("/billing") || path.includes("/bills")) {
-        return ["Fatture", "Bills"];
-      }
-      if (path.includes("/profile") || path.includes("/profilo")) {
-        return ["Profilo", "Profile"];
-      }
-      if (path.includes("/home") || path.includes("/gestisci")) {
-        return ["Gestisci", "Home"];
-      }
-    } catch { /* fall through */ }
-    return [];
-  }
-
-  private async tryTargetAfterAppSection(
-    page: any,
-    auth: any,
-    targetUrl: string,
-    progress: (msg: string) => void
-  ): Promise<string | null> {
-    progress(`Retrying target after app section opened: ${targetUrl}`);
-    const ok = await this.navigateAndRecord(page, targetUrl, "authenticated target after app navigation");
-    if (!ok) return null;
-    if (auth?.auto_accept_cookies !== false) {
-      await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector")).catch(() => undefined);
-    }
-    const settledUrl = await this.waitForTargetUrlToSettle(page, targetUrl, 14000);
-    if (this.sameUrlWithoutHash(settledUrl, targetUrl)) {
-      return settledUrl;
-    }
-    logger.warn(`Target still redirected after in-app navigation. Requested ${targetUrl}, browser is on ${settledUrl}.`);
-    return null;
-  }
-
-  private async clickBestTargetLinkForUrl(page: any, targetUrl: string): Promise<boolean> {
-    const hints = this.inferTargetContentHints(targetUrl);
-    return page.evaluate((payload: { targetUrl: string; hints: string[] }) => {
-      const normalize = (value: string | null | undefined) => String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
-      const visible = (el: Element) => {
-        const rect = (el as HTMLElement).getBoundingClientRect();
-        const style = getComputedStyle(el as HTMLElement);
-        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) > 0.05;
-      };
-      const activate = (el: Element) => {
-        const clickable = (el.closest("a[href],button,[role='button'],[role='link'],[tabindex]") || el) as HTMLElement;
-        clickable.scrollIntoView({ block: "center", inline: "center" });
-        clickable.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
-        clickable.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
-        clickable.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
-        clickable.click();
-      };
-      const target = new URL(payload.targetUrl);
-      const targetPath = normalize(target.pathname);
-      const targetTail = normalize(target.pathname.split("/").filter(Boolean).slice(-2).join(" "));
-      const hints = payload.hints.map(normalize).filter(Boolean);
-      const candidates = Array.from(document.querySelectorAll("a[href],button,[role='button'],[role='link'],[tabindex],article,section,[class*='card' i]"))
-        .filter(visible);
-
-      const exactHref = candidates.find((el: any) => {
-        const href = normalize(el.href || el.getAttribute?.("href"));
-        return href && (href.includes(targetPath) || href.includes(payload.targetUrl.toLowerCase()));
-      });
-      if (exactHref) {
-        activate(exactHref);
-        return true;
-      }
-
-      const textMatch = candidates.find(el => {
-        const text = normalize([
-          el.textContent,
-          el.getAttribute?.("aria-label"),
-          el.getAttribute?.("title"),
-          el.closest?.("article,section,li,div")?.textContent
-        ].filter(Boolean).join(" "));
-        return hints.some(hint => text.includes(hint)) || (targetTail && text.includes(targetTail));
-      });
-      if (!textMatch) return false;
-      activate(textMatch);
-      return true;
-    }, { targetUrl, hints }).catch(() => false);
-  }
-
-  private inferTargetContentHints(targetUrl: string): string[] {
-    try {
-      const path = new URL(targetUrl).pathname.toLowerCase();
-      if (path.includes("/bb")) return ["Sky Wifi", "Wifi", "Internet", "Fibra", "Abbonamento Wifi", "Broadband"];
-      if (path.includes("/tv")) return ["Abbonamento TV", "Sky TV", "TV"];
-      if (path.includes("/voucher")) return ["Voucher", "Codice", "Buono"];
-      if (path.includes("/mobile")) return ["Mobile", "Sky Mobile"];
-      return path.split("/").filter(Boolean);
-    } catch {
-      return [];
-    }
-  }
-
-  private async waitForTargetUrlToSettle(page: any, expectedUrl: string, timeoutMs = 18000): Promise<string> {
-    const deadline = Date.now() + timeoutMs;
-    let lastUrl = "";
-    let stableSince = Date.now();
-
-    while (Date.now() < deadline) {
-      await page.waitForLoadState("domcontentloaded", { timeout: 2500 }).catch(() => undefined);
-      await page.waitForLoadState("networkidle", { timeout: 2500 }).catch(() => undefined);
-      await page.waitForTimeout(500).catch(() => undefined);
-
-      const currentUrl = (() => {
-        try { return page.url(); } catch { return expectedUrl; }
-      })();
-      this.recordNavigatedUrl(currentUrl, "authenticated target observed URL");
-
-      if (currentUrl !== lastUrl) {
-        lastUrl = currentUrl;
-        stableSince = Date.now();
-        continue;
-      }
-
-      const stableFor = Date.now() - stableSince;
-      if (this.sameUrlWithoutHash(currentUrl, expectedUrl) && stableFor >= 3000) {
-        return currentUrl;
-      }
-      if (!this.sameUrlWithoutHash(currentUrl, expectedUrl) && stableFor >= 4000 && !/\/login|\/security|signin|sign-in|auth/i.test(currentUrl)) {
-        return currentUrl;
-      }
-    }
-
-    try { return page.url(); } catch { return expectedUrl; }
-  }
-
-  private addTargetRedirectEvidence(requestedUrl: string, actualUrl: string): void {
-    this.recordNavigation(actualUrl, `redirected away from requested target: ${requestedUrl}`);
-    this.allIssues.push({
-      ruleId: "target-url-not-reached",
-      severity: "serious",
-      category: "navigation-coverage",
-      message: `The configured target URL was not scanned because the authenticated browser redirected to ${actualUrl}.`,
-      url: requestedUrl,
-      selector: "document",
-      tags: ["navigation-coverage", "advisory"],
-      fixSuggestion: "Verify the account entitlement, route guard, post-login forward URL, and any environment redirect rules for the requested target.",
-      evidenceExplanation: `Requested target: ${requestedUrl}. Final browser URL: ${actualUrl}.`
-    });
-    this.testCases.push({
-      name: "Authenticated target URL redirected",
-      description: "The scanner attempted to open the configured authenticated target URL, but the application redirected to a different page before the accessibility modules could run.",
-      category: "hybrid-review",
-      wcagRef: "Navigation coverage",
-      status: "fail",
-      issueUrl: requestedUrl,
-      steps: [
-        `Open authenticated target URL: ${requestedUrl}.`,
-        `Actual browser URL after navigation settled: ${actualUrl}.`,
-        "Confirm whether the target URL is valid for the logged-in test account and environment."
-      ],
-      result: "Failed - target URL redirected before the requested page became scan-ready."
-    });
-  }
-
-  private async clickBestInteractiveByTextInRoot(root: any, label: string): Promise<boolean> {
-    return root.evaluate((label: string) => {
-      const normalize = (text: string) => text.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ").trim().toLowerCase();
-      const wanted = normalize(label);
-      const visible = (el: Element) => {
-        const rect = (el as HTMLElement).getBoundingClientRect();
-        const style = window.getComputedStyle(el as HTMLElement);
-        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-      };
-      const textFor = (el: Element) => normalize([
-        (el as HTMLElement).innerText,
-        el.textContent,
-        el.getAttribute("aria-label"),
-        el.getAttribute("title"),
-      ].filter(Boolean).join(" "));
-      const collect = (container: Document | ShadowRoot | Element): Element[] => {
-        const direct = Array.from(container.querySelectorAll("a[href],button,[role='button'],[role='link'],[role='menuitem'],[role='tab'],[tabindex]"));
-        const nested = Array.from(container.querySelectorAll("*"))
-          .flatMap(child => (child as HTMLElement).shadowRoot ? collect((child as HTMLElement).shadowRoot!) : []);
-        return [...direct, ...nested];
-      };
-      const matches = collect(document)
-        .filter(el => visible(el) && (textFor(el) === wanted || textFor(el).includes(wanted)))
-        .sort((a, b) => {
-          const ar = (a as HTMLElement).getBoundingClientRect();
-          const br = (b as HTMLElement).getBoundingClientRect();
-          const exactA = textFor(a) === wanted ? 0 : 1;
-          const exactB = textFor(b) === wanted ? 0 : 1;
-          return exactA - exactB || (ar.width * ar.height) - (br.width * br.height);
-        });
-      const target = matches[0] as HTMLElement | undefined;
-      if (!target) return false;
-      target.scrollIntoView({ block: "center", inline: "center" });
-      target.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
-      target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
-      target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
-      target.click();
-      return true;
-    }, label);
   }
 
   private async tryFillFirst(page: any, selectorList: string | undefined, value: string, timeout = 5000): Promise<boolean> {
@@ -1714,32 +1903,20 @@ export class AccessibilityScanner {
     targetUrl: string,
     opts: ScanOptions,
     extraStates: StateConfig[],
-    progress: (msg: string) => void,
-    strictExpectedUrl?: string
+    progress: (msg: string) => void
   ): Promise<void> {
-    this.recordNavigation(page.url(), `scan start: ${targetUrl}`);
-    if (this.scan.auth_config?.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(this.scan.auth_config, "cookie_accept_selector"));
-    if (await this.hasCookieConsentPrompt(page)) {
-      throw new Error(`Cookie consent prompt is still blocking ${targetUrl}; scan aborted for this page to avoid reporting the login/privacy overlay.`);
-    }
-    await this.waitForMeaningfulPageContent(page, targetUrl);
-    const actualUrl = (() => {
-      try { return page.url(); } catch { return targetUrl; }
-    })();
-    if (strictExpectedUrl && !this.sameUrlWithoutHash(actualUrl, strictExpectedUrl)) {
-      this.recordNavigatedUrl(actualUrl, "strict target final URL");
-      this.recordNavigation(actualUrl, `redirected away from requested target: ${strictExpectedUrl}`);
-      progress(`WARN: Refusing to scan redirected target. Requested ${strictExpectedUrl}, browser is on ${actualUrl}`);
-      logger.warn(`Refusing to scan redirected target. Requested ${strictExpectedUrl}, browser is on ${actualUrl}.`);
-      this.addTargetRedirectEvidence(strictExpectedUrl, actualUrl);
-      return;
-    }
     const pageKey = this.scanPageKey(targetUrl);
     if (this.scannedPageKeys.has(pageKey)) {
       progress(`Skipping duplicate page scan: ${targetUrl}`);
       return;
     }
     this.scannedPageKeys.add(pageKey);
+
+    if (this.scan.auth_config?.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(this.scan.auth_config, "cookie_accept_selector"));
+    if (await this.hasCookieConsentPrompt(page)) {
+      throw new Error(`Cookie consent prompt is still blocking ${targetUrl}; scan aborted for this page to avoid reporting the login/privacy overlay.`);
+    }
+    await this.waitForMeaningfulPageContent(page, targetUrl);
     await this.prepareFullPageForScan(page, targetUrl, progress);
 
     if (opts.run_axe !== false) {
@@ -1777,9 +1954,7 @@ export class AccessibilityScanner {
       this.allIssues.push(...await runKeyboardNav(page, targetUrl, this.scan.state_label));
     }
 
-    if (opts.run_states !== false && this.isDestinationOnlyTargetRun(opts)) {
-      progress(`Skipping navigational state exploration on destination-only target scan: ${targetUrl}`);
-    } else if (opts.run_states !== false) {
+    if (opts.run_states !== false) {
       progress(`Testing UI states (hover/focus/expanded/error) on ${targetUrl}`);
       const stateResults = await runStateScanning(page, targetUrl, extraStates, async () => {
         if (this.scan.auth_config?.auto_accept_cookies !== false) {
@@ -1808,286 +1983,11 @@ export class AccessibilityScanner {
       this.domSnapshots.push(await this.captureSnapshot(page, targetUrl, "initial", opts.capture_screenshots !== false));
     }
 
-    if (opts.controlled_interaction_scan) {
-      await this.runControlledInteractionScan(page, targetUrl, opts, progress);
-    }
-
     const urlIssues = this.allIssues.filter(i => i.url === targetUrl);
     await enrichOwnership(page, urlIssues, { dsPrefix: "" });
     if (opts.capture_screenshots !== false) {
       await this.attachIssueEvidence(page, urlIssues);
     }
-  }
-
-  private isDestinationOnlyTargetRun(opts: ScanOptions): boolean {
-    return (Array.isArray(opts.target_interactions) ? opts.target_interactions : [])
-      .some(target => target && target.scan_destination_only !== false);
-  }
-
-  private async runControlledInteractionScan(
-    page: any,
-    targetUrl: string,
-    opts: ScanOptions,
-    progress: (msg: string) => void
-  ): Promise<void> {
-    const mode = opts.controlled_interaction_mode || "safe-auto";
-    const limit = Math.max(1, Math.min(60, Number(opts.controlled_interaction_limit) || 12));
-    const allowlist = (opts.controlled_interaction_allowlist || []).map(item => item.toLowerCase().trim()).filter(Boolean);
-    progress(`Controlled interaction scan (${mode}) on ${targetUrl}`);
-    const discovered = await this.discoverControlledInteractions(page);
-    const report: ControlledInteractionReportItem[] = [];
-    const attempted = new Set<string>();
-    const baseUrl = (() => { try { return page.url(); } catch { return targetUrl; } })();
-
-    for (const item of discovered) {
-      if (report.filter(row => ["clicked", "scanned", "failed"].includes(row.status)).length >= limit) break;
-      const labelKey = `${item.selector}|${item.label}|${item.href || ""}`;
-      if (attempted.has(labelKey)) continue;
-      attempted.add(labelKey);
-      const decision = this.controlledInteractionDecision(item, mode, allowlist, baseUrl);
-      if (!decision.click) {
-        report.push({ ...item, status: decision.status, reason: decision.reason });
-        continue;
-      }
-      const before = await this.controlledPageSignature(page);
-      try {
-        const clicked = await page.locator(item.selector).first().click({ timeout: 5000, trial: false }).then(() => true).catch(() => false);
-        if (!clicked) {
-          report.push({ ...item, status: "failed", reason: "Element was discovered but Playwright could not click it." });
-          continue;
-        }
-        await page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => undefined);
-        await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => undefined);
-        await page.waitForTimeout(800);
-        const after = await this.controlledPageSignature(page);
-        const currentUrl = after.url || targetUrl;
-        const changedUrl = before.url && after.url && before.url !== after.url;
-        const changedDom = before.signature !== after.signature;
-        if (changedUrl && !this.sameHostname(before.url, currentUrl)) {
-          report.push({ ...item, status: "blocked", outcome: "external navigation", reason: `Navigation left the starting host: ${currentUrl}` });
-          await this.navigateAndRecord(page, baseUrl, "controlled interaction restore");
-          continue;
-        }
-        if (changedUrl || changedDom) {
-          const stateName = this.controlledStateName(item.label || item.kind);
-          const scanUrl = changedUrl ? currentUrl : `${targetUrl}#${encodeURIComponent(stateName)}`;
-          await this.scanControlledInteractionState(page, scanUrl, opts, progress, stateName);
-          report.push({ ...item, status: "scanned", outcome: changedUrl ? "navigated and scanned" : "in-page state changed and scanned", scannedUrl: scanUrl });
-          if (changedUrl) {
-            await page.goBack({ waitUntil: "domcontentloaded", timeout: 8000 }).catch(() => undefined);
-            if (!this.sameUrlWithoutHash(page.url(), baseUrl)) {
-              await this.navigateAndRecord(page, baseUrl, "controlled interaction restore");
-            }
-          } else {
-            await page.keyboard.press("Escape").catch(() => undefined);
-          }
-        } else {
-          report.push({ ...item, status: "clicked", outcome: "clicked; no visible URL or DOM state change detected" });
-        }
-      } catch (err: any) {
-        report.push({ ...item, status: "failed", reason: err?.message || "Click failed." });
-        await this.navigateAndRecord(page, baseUrl, "controlled interaction error restore").catch(() => undefined);
-      }
-    }
-
-    this.domSnapshots.push({
-      url: targetUrl,
-      phase: "controlled interaction report",
-      state: "controlled-interactions",
-      a11yTree: {
-        type: "controlled-interaction-report",
-        mode,
-        limit,
-        summary: report.reduce((acc: Record<string, number>, item) => {
-          acc[item.status] = (acc[item.status] || 0) + 1;
-          return acc;
-        }, {}),
-        items: report,
-      },
-    });
-  }
-
-  private async scanControlledInteractionState(
-    page: any,
-    scanUrl: string,
-    opts: ScanOptions,
-    progress: (msg: string) => void,
-    stateName: string
-  ): Promise<void> {
-    progress(`Scanning controlled interaction state: ${stateName}`);
-    if (opts.run_axe !== false) this.allIssues.push(...await runAxe(page, scanUrl, stateName, `controlled:${stateName}`));
-    if (opts.run_heuristics !== false) this.allIssues.push(...await runHeuristics(page, scanUrl, stateName, `controlled:${stateName}`));
-    if (opts.run_focus !== false) this.allIssues.push(...await runFocusHeuristics(page, scanUrl, stateName, `controlled:${stateName}`));
-    if (opts.run_color !== false) this.allIssues.push(...await runColorChecks(page, scanUrl, stateName, `controlled:${stateName}`));
-    if (opts.run_pointer !== false) this.allIssues.push(...await runPointerChecks(page, scanUrl, stateName, `controlled:${stateName}`));
-    if (opts.run_live_dom !== false) {
-      this.domSnapshots.push(await this.captureSnapshot(page, scanUrl, `controlled: ${stateName}`, opts.capture_screenshots !== false));
-    }
-  }
-
-  private async discoverControlledInteractions(page: any): Promise<Array<{ label: string; selector: string; kind: string; href?: string; status: ControlledInteractionReportItem["status"] }>> {
-    return page.evaluate(() => {
-      const visible = (el: Element) => {
-        const rect = (el as HTMLElement).getBoundingClientRect();
-        const style = window.getComputedStyle(el as HTMLElement);
-        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && style.pointerEvents !== "none";
-      };
-      const cssEscape = (value: string) => {
-        const esc = (window as any).CSS?.escape;
-        return esc ? esc(value) : value.replace(/[^a-zA-Z0-9_-]/g, "\\$&");
-      };
-      const selectorFor = (el: Element): string => {
-        const id = el.getAttribute("id");
-        if (id) return `#${cssEscape(id)}`;
-        const parts: string[] = [];
-        let node: Element | null = el;
-        while (node && node.nodeType === 1 && parts.length < 5) {
-          const tag = node.tagName.toLowerCase();
-          const attr = node.getAttribute("data-testid") || node.getAttribute("aria-label") || node.getAttribute("name");
-          if (attr) {
-            parts.unshift(`${tag}[${node.getAttribute("data-testid") ? "data-testid" : node.getAttribute("aria-label") ? "aria-label" : "name"}="${attr.replace(/"/g, '\\"')}"]`);
-            break;
-          }
-          const parent: Element | null = node.parentElement;
-          if (!parent) {
-            parts.unshift(tag);
-            break;
-          }
-          const siblings = Array.from(parent.children).filter((child: Element) => child.tagName === node!.tagName);
-          const index = siblings.indexOf(node) + 1;
-          parts.unshift(`${tag}:nth-of-type(${Math.max(1, index)})`);
-          node = parent;
-        }
-        return parts.join(" > ");
-      };
-      const textFor = (el: Element) => [
-        el.getAttribute("aria-label"),
-        el.getAttribute("title"),
-        (el as HTMLElement).innerText,
-        el.textContent,
-      ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 140);
-      const selector = "a[href],button,[role='button'],[role='link'],summary,input[type='button'],input[type='submit'],[tabindex]:not([tabindex='-1'])";
-      const seen = new Set<string>();
-      return Array.from(document.querySelectorAll(selector))
-        .filter(el => visible(el))
-        .map(el => {
-          const selector = selectorFor(el);
-          const href = (el as HTMLAnchorElement).href || el.getAttribute("href") || "";
-          const kind = el.tagName.toLowerCase() === "a" || el.getAttribute("role") === "link" ? "link" : "button";
-          const label = textFor(el) || href || selector;
-          return { label, selector, kind, href, status: "skipped" as const };
-        })
-        .filter(item => {
-          const key = `${item.selector}|${item.label}|${item.href}`;
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        })
-        .slice(0, 120);
-    }).catch(() => []);
-  }
-
-  private controlledInteractionDecision(
-    item: { label: string; selector: string; href?: string; kind: string },
-    mode: string,
-    allowlist: string[],
-    baseUrl: string
-  ): { click: boolean; status: ControlledInteractionReportItem["status"]; reason?: string } {
-    const haystack = `${item.label} ${item.selector} ${item.href || ""}`.toLowerCase();
-    const risky = /(logout|log out|sign out|elimina|delete|rimuovi|remove|disdici|annulla|cancel|acquista|buy|checkout|paga|payment|conferma|confirm|salva|save|submit|invia|send|prosegui|procedi)/i;
-    if (risky.test(haystack)) return { click: false, status: "blocked", reason: "Blocked by non-destructive safety rules." };
-    if (item.href && !this.sameHostname(baseUrl, item.href)) return { click: false, status: "blocked", reason: "External link is outside the scan host." };
-    if (mode === "tester-selected") {
-      const allowed = allowlist.some(token => token && haystack.includes(token));
-      return allowed ? { click: true, status: "clicked" } : { click: false, status: "skipped", reason: "Not selected by tester allowlist." };
-    }
-    if (mode === "safe-auto") {
-      const safe = /(scopri|dettagli|detail|modifica|edit|espandi|expand|apri|open|chiudi|close|note|info|indietro|back|tab|menu|assistenza|support|fissa|appuntamento)/i.test(haystack);
-      return safe ? { click: true, status: "clicked" } : { click: false, status: "skipped", reason: "Skipped in safe-auto mode because it was not clearly non-destructive." };
-    }
-    return { click: true, status: "clicked" };
-  }
-
-  private async controlledPageSignature(page: any): Promise<{ url: string; signature: string }> {
-    return page.evaluate(() => {
-      const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
-      const dialogs = document.querySelectorAll("[role='dialog'],dialog,[aria-modal='true'],[class*='modal' i],[class*='drawer' i],[class*='sidebar' i]").length;
-      const expanded = Array.from(document.querySelectorAll("[aria-expanded='true']")).length;
-      return { url: location.href, signature: `${text.length}:${dialogs}:${expanded}:${document.body?.scrollHeight || 0}` };
-    }).catch(() => ({ url: "", signature: "" }));
-  }
-
-  private sameHostname(a: string, b: string): boolean {
-    try { return new URL(a).hostname === new URL(b, a).hostname; } catch { return false; }
-  }
-
-  private controlledStateName(label: string): string {
-    return `controlled-${String(label || "interaction").replace(/\s+/g, " ").trim().slice(0, 48)}`;
-  }
-
-  private trackPageNavigations(page: any, context: string): void {
-    page.on("request", (request: any) => {
-      try {
-        if (request.isNavigationRequest?.() && request.resourceType?.() === "document" && request.frame?.() === page.mainFrame()) {
-          this.recordNavigatedUrl(request.url(), `${context} document request`);
-        }
-      } catch { /* ignore navigation observer errors */ }
-    });
-    page.on("framenavigated", (frame: any) => {
-      try {
-        if (frame === page.mainFrame()) {
-          this.recordNavigatedUrl(frame.url(), context);
-        }
-      } catch { /* ignore navigation observer errors */ }
-    });
-  }
-
-  private recordNavigatedUrl(rawUrl: string, context: string): void {
-    const url = String(rawUrl || "").trim();
-    if (!url || url === "about:blank") return;
-    if (this.navigatedUrlKeys.has(url)) return;
-    this.navigatedUrlKeys.add(url);
-    this.navigatedUrls.push(url);
-    logger.info(`Scan navigated through URL (${context}): ${url}`);
-  }
-
-  private recordNavigation(url: string, phase: string): void {
-    const href = String(url || "").trim();
-    if (!href) return;
-    const previous = this.domSnapshots[this.domSnapshots.length - 1];
-    if (previous?.url === href && previous?.phase === phase) return;
-    this.domSnapshots.push({
-      url: href,
-      phase: `navigation: ${phase}`,
-      state: this.scan.state_label,
-      a11yTree: {
-        type: "navigation-event",
-        offsetMs: Date.now() - this.navigationStartTime,
-      },
-    });
-  }
-
-  private async navigateAndRecord(page: any, url: string, phase: string): Promise<boolean> {
-    this.recordNavigatedUrl(url, `${phase} requested`);
-    const started = Date.now();
-    const ok = await navigateSafely(page, url);
-    const currentUrl = (() => {
-      try { return page.url(); } catch { return url; }
-    })();
-    this.recordNavigatedUrl(currentUrl || url, `${phase} reached`);
-    this.domSnapshots.push({
-      url: currentUrl || url,
-      phase: `navigation: ${phase}`,
-      state: this.scan.state_label,
-      a11yTree: {
-        type: "navigation-event",
-        requestedUrl: url,
-        success: ok,
-        offsetMs: started - this.navigationStartTime,
-        durationMs: Date.now() - started,
-      },
-    });
-    return ok;
   }
 
   private scanPageKey(targetUrl: string): string {
@@ -2100,18 +2000,6 @@ export class AccessibilityScanner {
       return `${host}${path}${parsed.search}${hash}`;
     } catch {
       return targetUrl;
-    }
-  }
-
-  private scanPageKeyWithoutState(targetUrl: string): string {
-    try {
-      const parsed = new URL(targetUrl);
-      parsed.hash = "";
-      const host = parsed.hostname.toLowerCase();
-      const path = parsed.pathname.replace(/\/+$/, "") || "/";
-      return `${host}${path}${parsed.search}`;
-    } catch {
-      return String(targetUrl || "").split("#")[0];
     }
   }
 
@@ -2193,7 +2081,7 @@ export class AccessibilityScanner {
       if (!passesCrawlFilters(url, seedUrl, opts)) continue;
 
       progress(`Crawl (${scannedKeys.size + 1}/${maxPages}, depth ${depth}): ${url}`);
-      const ok = await this.navigateAndRecord(page, url, "crawl");
+      const ok = await this.navigateAndRecord(page, url, `crawl depth ${depth}`);
       if (!ok) {
         logger.warn(`Crawl: skipping unreachable URL: ${url}`);
         continue;
@@ -2229,31 +2117,19 @@ export class AccessibilityScanner {
     scannedKeys: Set<string>,
     authConfig: any
   ): Promise<void> {
-    const labels = (Array.isArray(opts.post_login_pages) ? opts.post_login_pages : [])
-      .map(label => String(label).trim())
-      .filter(Boolean);
-    const destinationOnlyLaunchPages = new Set(
-      (Array.isArray(opts.target_interactions) ? opts.target_interactions : [])
-        .filter(target => target.scan_destination_only !== false)
-        .map(target => String(target.base_page || "").trim().toLowerCase())
-        .filter(Boolean)
-    );
+    if (opts.post_login_tab_scan === false) return;
+    const labels = (Array.isArray(opts.post_login_pages) ? opts.post_login_pages : [
+      "Offerte",
+      "Profilo",
+      "Impostazioni",
+      "Fatture",
+      "Scopri l'app My Sky"
+    ]).map(label => String(label).trim()).filter(Boolean);
     let scannedCount = 0;
 
-    if (!labels.length) {
-      progress("No authenticated post-login pages selected for scanning");
-      return;
-    }
-
-    if (opts.post_login_tab_scan !== false) {
-      await this.checkConfiguredPostLoginTabKeyboard(page, labels, baseUrl, progress);
-    }
+    await this.checkConfiguredPostLoginTabKeyboard(page, labels, baseUrl, progress);
 
     for (const label of labels) {
-      if (destinationOnlyLaunchPages.has(label.toLowerCase())) {
-        progress(`Using ${label} only as a targeted interaction launch page; skipping full page scan`);
-        continue;
-      }
       const previousUrl = page.url();
       try {
         progress(`Opening authenticated section: ${label}`);
@@ -2266,7 +2142,6 @@ export class AccessibilityScanner {
         await page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => undefined);
         await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => undefined);
         await page.waitForTimeout(1500);
-        this.recordNavigation(page.url(), `authenticated section: ${label}`);
         if (authConfig?.auto_accept_cookies !== false) {
           await this.clearCookieConsentWithProgress(page, this.authSelector(authConfig, "cookie_accept_selector"), progress, label);
         }
@@ -2290,602 +2165,8 @@ export class AccessibilityScanner {
       }
     }
     if (labels.length && scannedCount === 0) {
-      const currentUrl = page.url();
-      progress(`WARN: None of the configured authenticated sections were found: ${labels.join(", ")}. Scanning current authenticated page instead.`);
-      logger.warn(`None of the configured authenticated sections were scanned; falling back to current page: ${currentUrl}`);
-      const fallbackUrl = currentUrl && currentUrl !== "about:blank" ? currentUrl : baseUrl;
-      const fallbackScanUrl = fallbackUrl.includes("#")
-        ? fallbackUrl
-        : `${fallbackUrl}#${encodeURIComponent("authenticated fallback")}`;
-      const key = this.scanPageKey(fallbackScanUrl);
-      if (!scannedKeys.has(key)) {
-        await this.ensureAuthenticatedPage(page, authConfig, fallbackScanUrl).catch((err: any) => {
-          logger.warn(`Authenticated fallback verification warning for ${fallbackScanUrl}:`, err);
-        });
-        await this.runFullPageScan(page, fallbackScanUrl, opts, extraStates, progress);
-        scannedKeys.add(key);
-      }
+      throw new Error(`None of the configured authenticated sections were scanned: ${labels.join(", ")}`);
     }
-  }
-
-  private async scanTargetedInteractions(
-    page: any,
-    baseUrl: string,
-    opts: ScanOptions,
-    extraStates: StateConfig[],
-    progress: (msg: string) => void,
-    scannedKeys: Set<string>,
-    authConfig: any
-  ): Promise<void> {
-    const targets = (Array.isArray(opts.target_interactions) ? opts.target_interactions : [])
-      .map(target => ({
-        ...target,
-        mode: (target.mode === "journey" ? "journey" : "single-interaction") as TargetInteractionConfig["mode"],
-        base_page: String(target.base_page || "").trim(),
-        name: String(target.name || target.text || target.href_contains || target.selector || "Target interaction").trim(),
-        selector: String(target.selector || "").trim(),
-        text: String(target.text || "").trim(),
-        cta_text: String(target.cta_text || "").trim(),
-        href_contains: String(target.href_contains || "").trim(),
-        click_type: target.click_type || "any",
-        scan_destination_only: target.scan_destination_only !== false,
-        scan_launch_page: target.scan_launch_page === true,
-        steps: Array.isArray(target.steps) ? target.steps : [],
-      }))
-      .filter(target => target.base_page && (
-        target.mode === "journey"
-          ? target.steps.some((step: any) => step?.action === "navigate-page" ? String(step.page || "").trim() : Boolean(step.selector || step.text || step.cta_text || step.href_contains))
-          : Boolean(target.selector || target.text || target.cta_text || target.href_contains)
-      ));
-
-    if (!targets.length) return;
-
-    for (const target of targets) {
-      if (target.mode === "journey") {
-        await this.scanTargetJourney(page, baseUrl, target, opts, extraStates, progress, scannedKeys, authConfig);
-        continue;
-      }
-      await this.scanSingleTargetInteraction(page, baseUrl, target, opts, extraStates, progress, scannedKeys, authConfig);
-    }
-  }
-
-  private async scanSingleTargetInteraction(
-    page: any,
-    baseUrl: string,
-    target: TargetInteractionConfig,
-    opts: ScanOptions,
-    extraStates: StateConfig[],
-    progress: (msg: string) => void,
-    scannedKeys: Set<string>,
-    authConfig: any
-  ): Promise<void> {
-    const displayName = target.name || "Target interaction";
-    try {
-      progress(`Preparing targeted interaction "${displayName}" from ${target.base_page}`);
-
-      await this.openAuthenticatedLaunchPage(page, target.base_page, baseUrl, authConfig, progress);
-      const launchUrl = page.url();
-
-      if (authConfig?.auto_accept_cookies !== false) {
-        await this.clearCookieConsentWithProgress(page, this.authSelector(authConfig, "cookie_accept_selector"), progress, target.base_page);
-      }
-      await this.ensureAuthenticatedPage(page, authConfig, target.base_page);
-
-      if (target.scan_launch_page === true || target.scan_destination_only === false) {
-        await this.scanTargetDestinationOnce(page, `${launchUrl}#${encodeURIComponent(`${displayName}-launch`)}`, opts, extraStates, progress, scannedKeys, `target-launch:${displayName}`);
-      }
-
-      await this.prepareTargetLaunchPage(page, displayName, progress);
-
-      const clicked = await this.clickTargetInteraction(page, target);
-      if (!clicked) {
-        progress(`WARN: Targeted interaction not found: ${displayName}`);
-        this.testCases.push({
-          name: `Targeted destination scan: ${displayName}`,
-          description: `Navigate to ${target.base_page}, find the configured target, click it, and scan only the destination page.`,
-          category: "hybrid-review",
-          wcagRef: "WCAG 2.1.1 / 2.4.3 / 4.1.2",
-          status: "pending",
-          issueUrl: launchUrl,
-          steps: [
-            `Open authenticated page: ${target.base_page}.`,
-            `Find target using ${this.targetCriteriaText(target)}.`,
-            "Click the target and scan the destination page.",
-          ],
-          result: "Blocked - the configured target was not found during this run."
-        });
-        return;
-      }
-
-      await this.waitAfterTargetStep(page, authConfig, progress, displayName);
-      const destinationUrl = this.currentTargetUrl(page, launchUrl, displayName);
-      const scanned = await this.scanTargetDestinationOnce(page, destinationUrl, opts, extraStates, progress, scannedKeys, `target:${displayName}`);
-      const sidebarScanCount = await this.scanDiscoveredSidebarDestinations(page, destinationUrl, opts, extraStates, progress, scannedKeys, displayName, authConfig);
-      if (!scanned && sidebarScanCount === 0) {
-        progress(`Skipping duplicate targeted destination scan: ${displayName}`);
-        return;
-      }
-      this.testCases.push({
-        name: `Targeted destination scan: ${displayName}`,
-        description: `The scanner used ${target.base_page} as a launch page, clicked the configured target, and scanned the resulting destination page.`,
-        category: "hybrid-review",
-        wcagRef: "WCAG 2.1.1 / 2.4.3 / 4.1.2",
-        status: "pass",
-        issueUrl: destinationUrl,
-        steps: [
-          `Open authenticated page: ${target.base_page}.`,
-          `Find target using ${this.targetCriteriaText(target)}.`,
-          "Activate the target.",
-          "Run the configured accessibility modules on the destination page.",
-        ],
-        result: sidebarScanCount > 0 ? `Destination scanned: ${destinationUrl}; sidebar destinations scanned: ${sidebarScanCount}.` : `Destination scanned: ${destinationUrl}`
-      });
-      progress(`SUCCESS: Completed targeted destination scan: ${displayName}`);
-    } catch (err) {
-      progress(`ERROR: Targeted interaction failed for ${displayName}: ${(err as Error)?.message || err}`);
-      this.testCases.push({
-        name: `Targeted destination scan: ${displayName}`,
-        description: `Navigate to ${target.base_page}, click the configured target, and scan the destination page.`,
-        category: "hybrid-review",
-        wcagRef: "WCAG 2.1.1 / 2.4.3 / 4.1.2",
-        status: "pending",
-        steps: [`Open ${target.base_page}.`, `Find and click: ${this.targetCriteriaText(target)}.`],
-        result: `Blocked - ${(err as Error)?.message || "targeted interaction failed"}.`
-      });
-      logger.warn(`Targeted interaction failed for ${displayName}:`, err);
-    }
-  }
-
-  private async scanTargetJourney(
-    page: any,
-    baseUrl: string,
-    target: TargetInteractionConfig,
-    opts: ScanOptions,
-    extraStates: StateConfig[],
-    progress: (msg: string) => void,
-    scannedKeys: Set<string>,
-    authConfig: any
-  ): Promise<void> {
-    const displayName = target.name || "Target journey";
-    const executedSteps: string[] = [];
-    try {
-      progress(`Preparing target journey "${displayName}" from ${target.base_page}`);
-      await this.openAuthenticatedLaunchPage(page, target.base_page, baseUrl, authConfig, progress);
-      const launchUrl = page.url();
-      await this.ensureAuthenticatedPage(page, authConfig, target.base_page);
-
-      if (target.scan_launch_page === true || target.scan_destination_only === false) {
-        await this.scanTargetDestinationOnce(page, `${launchUrl}#${encodeURIComponent(`${displayName}-launch`)}`, opts, extraStates, progress, scannedKeys, `journey-launch:${displayName}`);
-      }
-
-      let scanCount = 0;
-      const steps = (target.steps || []).map(step => this.normalizeTargetStep(step)).filter(Boolean) as TargetJourneyStep[];
-      for (let i = 0; i < steps.length; i++) {
-        const step = steps[i];
-        const label = step.name || step.page || step.text || step.cta_text || step.href_contains || step.selector || `Step ${i + 1}`;
-        if (step.action === "navigate-page") {
-          if (!step.page) throw new Error(`Journey step ${i + 1} is missing page`);
-          progress(`Journey "${displayName}" step ${i + 1}: navigate to ${step.page}`);
-          await this.openAuthenticatedLaunchPage(page, step.page, baseUrl, authConfig, progress);
-          executedSteps.push(`Navigate to ${step.page}.`);
-        } else {
-          progress(`Journey "${displayName}" step ${i + 1}: click ${label}`);
-          await this.prepareTargetLaunchPage(page, `${displayName} / ${label}`, progress);
-          const clicked = await this.clickTargetInteraction(page, { ...target, ...step, name: step.name || label, base_page: target.base_page });
-          if (!clicked) throw new Error(`Journey step ${i + 1} target not found: ${label}`);
-          await this.waitAfterTargetStep(page, authConfig, progress, label);
-          executedSteps.push(`Click ${this.targetCriteriaText({ ...target, ...step, name: step.name || label, base_page: target.base_page })}.`);
-        }
-
-        if (step.scan_after_step === true) {
-          progress(`Journey "${displayName}" step ${i + 1} reached ${page.url()}; intermediate step scan suppressed so only the final journey destination is scanned`);
-        }
-      }
-
-      const finalUrl = this.currentTargetUrl(page, launchUrl, displayName);
-      const scanned = await this.scanTargetDestinationOnce(page, finalUrl, opts, extraStates, progress, scannedKeys, `journey:${displayName}:final`);
-      if (scanned) scanCount++;
-      scanCount += await this.scanDiscoveredSidebarDestinations(page, finalUrl, opts, extraStates, progress, scannedKeys, displayName, authConfig);
-
-      this.testCases.push({
-        name: `Target journey scan: ${displayName}`,
-        description: `The scanner executed the configured page/link journey and scanned the requested target destination.`,
-        category: "hybrid-review",
-        wcagRef: "WCAG 2.1.1 / 2.4.3 / 4.1.2",
-        status: scanCount > 0 ? "pass" : "pending",
-        issueUrl: page.url(),
-        steps: [`Open launch page: ${target.base_page}.`, ...executedSteps, "Run accessibility modules on configured destination page."],
-        result: scanCount > 0 ? `Journey completed; ${scanCount} target page(s) scanned.` : "Journey completed, but destination was already scanned or unavailable."
-      });
-      progress(`SUCCESS: Completed target journey scan: ${displayName}`);
-    } catch (err) {
-      progress(`ERROR: Target journey failed for ${displayName}: ${(err as Error)?.message || err}`);
-      this.testCases.push({
-        name: `Target journey scan: ${displayName}`,
-        description: `Execute configured navigation/click steps and scan the target destination.`,
-        category: "hybrid-review",
-        wcagRef: "WCAG 2.1.1 / 2.4.3 / 4.1.2",
-        status: "pending",
-        steps: [`Open ${target.base_page}.`, ...executedSteps],
-        result: `Blocked - ${(err as Error)?.message || "target journey failed"}.`
-      });
-      logger.warn(`Target journey failed for ${displayName}:`, err);
-    }
-  }
-
-
-  private async scanDiscoveredSidebarDestinations(
-    page: any,
-    baseUrl: string,
-    opts: ScanOptions,
-    extraStates: StateConfig[],
-    progress: (msg: string) => void,
-    scannedKeys: Set<string>,
-    contextLabel: string,
-    authConfig: any
-  ): Promise<number> {
-    if ((opts as any).scan_sidebar_links === false) return 0;
-    const initialTargets = await this.discoverSidebarActionTargets(page);
-    if (!initialTargets.length) return 0;
-
-    let scannedCount = 0;
-    progress(`Scanning open sidebar for "${contextLabel}" with ${initialTargets.length} option${initialTargets.length === 1 ? "" : "s"}`);
-    const sidebarUrl = this.currentTargetUrl(page, baseUrl, `${contextLabel}-sidebar`);
-    if (await this.scanTargetDestinationOnce(page, sidebarUrl, opts, extraStates, progress, scannedKeys, `sidebar:${contextLabel}:open`)) {
-      scannedCount++;
-    }
-
-    for (let index = 0; index < initialTargets.length; index++) {
-      const target = initialTargets[index];
-      try {
-        if (index > 0) {
-          await this.returnToSidebarOptionList(page).catch(() => undefined);
-          await page.waitForTimeout(500).catch(() => undefined);
-        }
-        progress(`Opening sidebar option "${target.label}"`);
-        const clicked = await this.clickSidebarActionTarget(page, target.label);
-        if (!clicked) {
-          progress(`WARN: Sidebar option was not found after returning to list: ${target.label}`);
-          continue;
-        }
-        await this.waitAfterTargetStep(page, authConfig, progress, target.label);
-        const optionUrl = this.currentTargetUrl(page, baseUrl, `${contextLabel}-sidebar-${target.label}`);
-        if (await this.scanTargetDestinationOnce(page, optionUrl, opts, extraStates, progress, scannedKeys, `sidebar:${contextLabel}:option:${index + 1}`)) {
-          scannedCount++;
-        }
-      } catch (err) {
-        logger.debug(`Sidebar option scan failed for ${target.label}:`, err);
-      }
-    }
-
-    if (scannedCount > 0) {
-      this.testCases.push({
-        name: `Sidebar destination scan: ${contextLabel}`,
-        description: `The scanner opened the sidebar, scanned it, clicked the visible sidebar options, and scanned the rendered sidebar destination content.`,
-        category: "hybrid-review",
-        wcagRef: "WCAG 2.1.1 / 2.4.3 / 4.1.2",
-        status: "pass",
-        issueUrl: page.url(),
-        steps: [
-          "Open the configured sidebar trigger.",
-          ...initialTargets.map(target => `Activate sidebar option: ${target.label}.`),
-          "Run accessibility modules on each rendered sidebar destination."
-        ],
-        result: `Sidebar scan completed; ${scannedCount} sidebar state/page${scannedCount === 1 ? "" : "s"} scanned.`
-      });
-    }
-    return scannedCount;
-  }
-
-  private async discoverSidebarActionTargets(page: any): Promise<{ label: string }[]> {
-    const raw = await page.evaluate(() => {
-      const normalize = (value: string | null | undefined) => String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
-      const visible = (el: Element) => {
-        const rect = (el as HTMLElement).getBoundingClientRect();
-        const style = getComputedStyle(el as HTMLElement);
-        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) > 0.05;
-      };
-      const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
-      const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-      const containers = Array.from(document.querySelectorAll("aside,[role='dialog'],[aria-modal='true'],[class*='sidebar' i],[class*='drawer' i],[class*='side-panel' i],[class*='sheet' i]"))
-        .filter(el => {
-          if (!visible(el)) return false;
-          const rect = (el as HTMLElement).getBoundingClientRect();
-          const style = getComputedStyle(el as HTMLElement);
-          const fixedOrLarge = style.position === "fixed" || style.position === "sticky" || rect.height >= viewportHeight * 0.45;
-          const rightDocked = rect.right >= viewportWidth - 24 && rect.width >= Math.min(260, viewportWidth * 0.35);
-          const dialogLike = el.getAttribute("role") === "dialog" || el.getAttribute("aria-modal") === "true";
-          return dialogLike || (fixedOrLarge && rightDocked);
-        })
-        .sort((a, b) => {
-          const ar = (a as HTMLElement).getBoundingClientRect();
-          const br = (b as HTMLElement).getBoundingClientRect();
-          return (br.width * br.height) - (ar.width * ar.height);
-        });
-      const sidebar = containers[0];
-      if (!sidebar) return [];
-      const excluded = /^(x|×|close|chiudi|indietro|back|conferma|submit)$/i;
-      return Array.from(sidebar.querySelectorAll("a[href],button,[role='button'],[role='link'],[tabindex]"))
-        .filter(el => visible(el))
-        .map(el => {
-          const label = [
-            el.textContent,
-            el.getAttribute("aria-label"),
-            el.getAttribute("title")
-          ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
-          return { label, normalized: normalize(label) };
-        })
-        .filter(item => item.label.length > 2 && !excluded.test(item.normalized) && !/privacy|informativa|cookie|termini|legal/i.test(item.normalized))
-        .slice(0, 8);
-    }).catch(() => []);
-
-    const seen = new Set<string>();
-    const targets: { label: string }[] = [];
-    for (const item of raw) {
-      const label = String(item.label || "").replace(/\s+/g, " ").trim().slice(0, 100);
-      const key = label.toLowerCase();
-      if (!label || seen.has(key)) continue;
-      seen.add(key);
-      targets.push({ label });
-    }
-    return targets;
-  }
-
-  private async clickSidebarActionTarget(page: any, label: string): Promise<boolean> {
-    return page.evaluate((expectedLabel: string) => {
-      const normalize = (value: string | null | undefined) => String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
-      const expected = normalize(expectedLabel);
-      const visible = (el: Element) => {
-        const rect = (el as HTMLElement).getBoundingClientRect();
-        const style = getComputedStyle(el as HTMLElement);
-        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) > 0.05;
-      };
-      const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
-      const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
-      const containers = Array.from(document.querySelectorAll("aside,[role='dialog'],[aria-modal='true'],[class*='sidebar' i],[class*='drawer' i],[class*='side-panel' i],[class*='sheet' i]"))
-        .filter(el => {
-          if (!visible(el)) return false;
-          const rect = (el as HTMLElement).getBoundingClientRect();
-          const style = getComputedStyle(el as HTMLElement);
-          const hasExplicitSidebarSignal = el.tagName.toLowerCase() === "aside" || el.getAttribute("role") === "dialog" || el.getAttribute("aria-modal") === "true" || /sidebar|drawer|side-panel|sheet/i.test(String(el.className || ""));
-          return hasExplicitSidebarSignal && (el.getAttribute("role") === "dialog" || el.getAttribute("aria-modal") === "true" || ((style.position === "fixed" || rect.height >= viewportHeight * 0.45) && rect.right >= viewportWidth - 24 && rect.width >= Math.min(260, viewportWidth * 0.35)));
-        });
-      const sidebar = containers[0] || document.body;
-      const candidates = Array.from(sidebar.querySelectorAll("a[href],button,[role='button'],[role='link'],[tabindex]"));
-      const match = candidates.find(el => visible(el) && normalize([el.textContent, el.getAttribute("aria-label"), el.getAttribute("title")].filter(Boolean).join(" ")).includes(expected)) as HTMLElement | undefined;
-      if (!match) return false;
-      const clickable = (match.closest("a[href],button,[role='button'],[role='link']") || match) as HTMLElement;
-      clickable.scrollIntoView({ block: "center", inline: "center" });
-      clickable.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
-      clickable.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
-      clickable.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
-      clickable.click();
-      return true;
-    }, label).catch(() => false);
-  }
-
-  private async returnToSidebarOptionList(page: any): Promise<boolean> {
-    const clicked = await page.evaluate(() => {
-      const normalize = (value: string | null | undefined) => String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
-      const visible = (el: Element) => {
-        const rect = (el as HTMLElement).getBoundingClientRect();
-        const style = getComputedStyle(el as HTMLElement);
-        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-      };
-      const candidates = Array.from(document.querySelectorAll("a[href],button,[role='button'],[tabindex]"));
-      const back = candidates.find(el => visible(el) && /indietro|back/.test(normalize([el.textContent, el.getAttribute("aria-label"), el.getAttribute("title")].filter(Boolean).join(" ")))) as HTMLElement | undefined;
-      if (!back) return false;
-      back.click();
-      return true;
-    }).catch(() => false);
-    if (clicked) {
-      await page.waitForTimeout(700).catch(() => undefined);
-    }
-    return clicked;
-  }
-
-
-  private async scanTargetDestinationOnce(
-    page: any,
-    destinationUrl: string,
-    opts: ScanOptions,
-    extraStates: StateConfig[],
-    progress: (msg: string) => void,
-    scannedKeys: Set<string>,
-    sourceKey: string
-  ): Promise<boolean> {
-    const key = this.scanPageKey(destinationUrl);
-    if (scannedKeys.has(key)) return false;
-    progress(`Scanning targeted page: ${destinationUrl}`);
-    await this.runFullPageScan(page, destinationUrl, opts, extraStates, progress);
-    scannedKeys.add(key);
-    return true;
-  }
-
-  private currentTargetUrl(page: any, launchUrl: string, fallbackLabel: string): string {
-    const currentUrl = page.url();
-    return currentUrl && currentUrl !== launchUrl
-      ? currentUrl
-      : `${launchUrl}#${encodeURIComponent(fallbackLabel)}`;
-  }
-
-  private normalizeTargetStep(step: TargetJourneyStep): TargetJourneyStep | null {
-    if (!step || !step.action) return null;
-    return {
-      action: step.action,
-      page: String(step.page || "").trim() || undefined,
-      name: String(step.name || "").trim() || undefined,
-      selector: String(step.selector || "").trim() || undefined,
-      text: String(step.text || "").trim() || undefined,
-      cta_text: String(step.cta_text || "").trim() || undefined,
-      href_contains: String(step.href_contains || "").trim() || undefined,
-      click_type: step.click_type || "any",
-      scan_after_step: step.scan_after_step === true,
-    };
-  }
-
-  private async waitAfterTargetStep(page: any, authConfig: any, progress: (msg: string) => void, label: string): Promise<void> {
-    await page.waitForLoadState("domcontentloaded", { timeout: 9000 }).catch(() => undefined);
-    await page.waitForLoadState("networkidle", { timeout: 9000 }).catch(() => undefined);
-    await page.waitForTimeout(1500);
-    if (authConfig?.auto_accept_cookies !== false) {
-      await this.clearCookieConsentWithProgress(page, this.authSelector(authConfig, "cookie_accept_selector"), progress, label);
-    }
-  }
-
-  private async openAuthenticatedLaunchPage(
-    page: any,
-    basePage: string,
-    fallbackUrl: string,
-    authConfig: any,
-    progress: (msg: string) => void
-  ): Promise<void> {
-    if (/^https?:\/\//i.test(basePage)) {
-      const ok = await this.navigateAndRecord(page, basePage, "target interaction base page");
-      if (!ok) throw new Error(`Launch page is unreachable: ${basePage}`);
-      await page.waitForTimeout(1200);
-      return;
-    }
-
-    const clicked = await this.clickByVisibleText(page, basePage);
-    if (!clicked) {
-      progress(`Launch page "${basePage}" not visible from current page; returning to ${fallbackUrl}`);
-      const ok = await this.navigateAndRecord(page, fallbackUrl, "target interaction fallback page");
-      if (!ok) throw new Error(`Could not return to authenticated launch root: ${fallbackUrl}`);
-      await page.waitForTimeout(1200);
-      const retry = await this.clickByVisibleText(page, basePage);
-      if (!retry) throw new Error(`Launch page navigation item was not found: ${basePage}`);
-    }
-    await page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => undefined);
-    await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => undefined);
-    await page.waitForTimeout(1200);
-    if (authConfig?.auto_accept_cookies !== false) {
-      await this.clearCookieConsent(page, this.authSelector(authConfig, "cookie_accept_selector")).catch(() => undefined);
-    }
-  }
-
-  private async clickTargetInteraction(page: any, target: TargetInteractionConfig): Promise<boolean> {
-    if (target.selector && await this.tryClickFirst(page, target.selector)) return true;
-
-    const cardText = String(target.text || target.name || "").trim();
-    const ctaText = String(target.cta_text || "").trim() || (String(target.name || "").trim() && String(target.text || "").trim()
-      ? String(target.text || "").trim()
-      : "");
-    const payload = {
-      text: cardText.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim(),
-      ctaText: ctaText.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim(),
-      hrefContains: String(target.href_contains || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim(),
-      clickType: target.click_type || "any",
-    };
-
-    const clicked = await page.evaluate((criteria: { text: string; ctaText: string; hrefContains: string; clickType: string }) => {
-      const visible = (el: Element) => {
-        const rect = (el as HTMLElement).getBoundingClientRect();
-        const style = window.getComputedStyle(el as HTMLElement);
-        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-      };
-      const normalize = (value: string | null | undefined) => String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
-      const elementText = (el: Element) => normalize([
-        el.textContent,
-        el.getAttribute("aria-label"),
-        el.getAttribute("title"),
-        el.closest("[aria-label]")?.getAttribute("aria-label"),
-      ].filter(Boolean).join(" "));
-      const isKind = (el: Element) => {
-        if (criteria.clickType === "any") return true;
-        const role = normalize(el.getAttribute("role"));
-        const tag = el.tagName.toLowerCase();
-        if (criteria.clickType === "button") return tag === "button" || role === "button";
-        if (criteria.clickType === "link") return tag === "a" || role === "link";
-        if (criteria.clickType === "heading-link") {
-          const link = el.closest("a[href],[role='link']");
-          return Boolean(link && (link.closest("h1,h2,h3,h4,h5,h6") || /title|heading|headline/i.test((link as HTMLElement).className || "")));
-        }
-        return true;
-      };
-      const activate = (el: Element) => {
-        const clickable = (el.closest("a[href],button,[role='button'],[role='link']") || el) as HTMLElement;
-        clickable.scrollIntoView({ block: "center", inline: "center" });
-        clickable.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
-        clickable.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
-        clickable.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
-        clickable.click();
-      };
-      const interactiveSelector = "a[href],button,[role='button'],[role='link'],[tabindex]";
-
-      if (criteria.text && criteria.ctaText) {
-        const containers = Array.from(document.querySelectorAll("article,section,li,[class*='card' i],[class*='promo' i],div"))
-          .filter(el => visible(el) && normalize(el.textContent).includes(criteria.text))
-          .sort((a, b) => {
-            const ar = (a as HTMLElement).getBoundingClientRect();
-            const br = (b as HTMLElement).getBoundingClientRect();
-            return (ar.width * ar.height) - (br.width * br.height);
-          });
-        for (const container of containers) {
-          const ctas = Array.from(container.querySelectorAll(interactiveSelector)).filter(el => visible(el) && isKind(el));
-          const match = ctas.find(el => {
-            const href = normalize((el as HTMLAnchorElement).href || el.getAttribute("href"));
-            const text = elementText(el);
-            const ctaOk = text.includes(criteria.ctaText);
-            const hrefOk = !criteria.hrefContains || !href || href.includes(criteria.hrefContains);
-            return ctaOk && hrefOk;
-          });
-          if (match) {
-            activate(match);
-            return true;
-          }
-        }
-      }
-
-      const candidates = Array.from(document.querySelectorAll(interactiveSelector));
-      const match = candidates.find(el => {
-        if (!visible(el) || !isKind(el)) return false;
-        const href = normalize((el as HTMLAnchorElement).href || el.getAttribute("href"));
-        const nearby = normalize(el.closest("article,section,li,div")?.textContent);
-        const text = normalize([elementText(el), nearby].filter(Boolean).join(" "));
-        const textOk = !criteria.text || text.includes(criteria.text);
-        const ctaOk = !criteria.ctaText || text.includes(criteria.ctaText);
-        const hrefOk = !criteria.hrefContains || href.includes(criteria.hrefContains);
-        return textOk && ctaOk && hrefOk;
-      }) as HTMLElement | undefined;
-      if (!match) return false;
-      activate(match);
-      return true;
-    }, payload).catch(() => false);
-
-    if (clicked) return true;
-    if (!cardText && ctaText && await this.clickByVisibleText(page, ctaText)) return true;
-    if (!ctaText && cardText && await this.clickByVisibleText(page, cardText)) return true;
-    return false;
-  }
-
-  private async prepareTargetLaunchPage(page: any, label: string, progress: (msg: string) => void): Promise<void> {
-    try {
-      progress(`Preparing targeted launch page for "${label}" by loading visible cards`);
-      await page.evaluate(async () => {
-        const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-        const maxScroll = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-        const step = Math.max(320, Math.floor(window.innerHeight * 0.75));
-        for (let y = 0; y <= maxScroll; y += step) {
-          window.scrollTo(0, y);
-          await delay(180);
-        }
-        window.scrollTo(0, 0);
-      });
-      await page.waitForTimeout(500);
-    } catch (err) {
-      logger.debug(`Target launch page preparation failed for ${label}:`, err);
-    }
-  }
-
-  private targetCriteriaText(target: TargetInteractionConfig): string {
-    return [
-      target.selector ? `selector "${target.selector}"` : "",
-      target.text ? `text "${target.text}"` : "",
-      target.cta_text ? `CTA "${target.cta_text}"` : "",
-      target.href_contains ? `href contains "${target.href_contains}"` : "",
-      target.click_type && target.click_type !== "any" ? `click type "${target.click_type}"` : "",
-    ].filter(Boolean).join(", ") || "configured target";
   }
 
   private async checkConfiguredPostLoginTabKeyboard(
@@ -3076,65 +2357,32 @@ export class AccessibilityScanner {
       try {
         const captured = await page.evaluate(async (payload: { selectors: string[]; ruleId: string }) => {
           const { selectors, ruleId } = payload;
-          type Candidate = { el: HTMLElement; selector: string; label: string; score: number; visible: boolean };
-          const visible = (el: HTMLElement) => {
-            const rect = el.getBoundingClientRect();
-            const style = getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" &&
-              el.getAttribute("aria-hidden") !== "true" && !el.closest("[hidden],[inert],[aria-hidden='true']");
-          };
-          const labelFor = (el: HTMLElement) => {
-            const role = el.getAttribute("role");
-            const tag = el.tagName.toLowerCase();
-            const type = role || ({ a: "link", button: "button", input: "input", select: "dropdown", textarea: "text area", img: "image", nav: "navigation", main: "main region", header: "header", footer: "footer" } as Record<string, string>)[tag] || "element";
-            const aria = el.getAttribute("aria-label") || el.getAttribute("title") || el.getAttribute("alt") || "";
-            const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
-            const card = el.closest("[aria-label],article,section,li,[class*='card'],[class*='promo'],[class*='tile']") as HTMLElement | null;
-            const cardText = card && card !== el ? (card.getAttribute("aria-label") || card.innerText || card.textContent || "").replace(/\s+/g, " ").trim() : "";
-            const name = (aria || text || cardText || el.id || String(el.className || "")).slice(0, 120).trim();
-            return name ? `${type}: ${name}` : type;
-          };
-          const matchesRule = (el: HTMLElement) => {
-            if (/target-size/i.test(ruleId || "")) {
-              const rect = el.getBoundingClientRect();
-              return /^(A|BUTTON|INPUT|SELECT|TEXTAREA)$/i.test(el.tagName) || el.hasAttribute("tabindex") || /button|link|checkbox|radio/.test(el.getAttribute("role") || "")
-                ? (rect.width < 24 || rect.height < 24)
-                : false;
-            }
-            return true;
-          };
-          const scoreFor = (el: HTMLElement, label: string, selector: string) => {
-            const rect = el.getBoundingClientRect();
-            let score = 0;
-            if (visible(el)) score += 100;
-            if (matchesRule(el)) score += 80;
-            if (selector.includes("#") || selector.includes(":nth-")) score += 20;
-            if (/button|link|input|dropdown|menuitem/i.test(label)) score += 12;
-            if (/sky\b|logo|brand/i.test(label)) score -= 50;
-            if (rect.width > 1 && rect.height > 1) score += Math.min(rect.width * rect.height / 1000, 20);
-            return score;
-          };
-          const candidates: Candidate[] = [];
+          let element: HTMLElement | null = null;
+          let selectedSelector = "";
           for (const selector of selectors) {
             try {
-              const matches = Array.from(document.querySelectorAll(selector)).slice(0, 25) as HTMLElement[];
-              for (const el of matches) {
-                const label = labelFor(el);
-                candidates.push({ el, selector, label, visible: visible(el), score: scoreFor(el, label, selector) });
+              const candidate = document.querySelector(selector) as HTMLElement | null;
+              if (!candidate) continue;
+              const rect = candidate.getBoundingClientRect();
+              const style = getComputedStyle(candidate);
+              const visible = rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+              if (visible) {
+                element = candidate;
+                selectedSelector = selector;
+                break;
+              }
+              if (!element) {
+                element = candidate;
+                selectedSelector = selector;
               }
             } catch { /* try the next selector */ }
           }
-          const uniqueLabels = Array.from(new Set(candidates.filter(c => c.visible && matchesRule(c.el)).map(c => c.label))).slice(0, 40);
-          candidates.sort((a, b) => b.score - a.score);
-          const chosen = candidates.find(c => c.visible && matchesRule(c.el)) || candidates.find(c => c.visible) || candidates[0];
-          if (!chosen) return { found: false, visible: false, affectedElements: uniqueLabels };
-          const element = chosen.el;
-          const selectedSelector = chosen.selector;
+          if (!element) return { found: false, visible: false };
 
           const rect = element.getBoundingClientRect();
           const style = getComputedStyle(element);
-          const isVisible = rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
-          if (isVisible) {
+          const visible = rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+          if (visible) {
             element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" as ScrollBehavior });
             if (/focus/i.test(ruleId || "") && typeof element.focus === "function") {
               element.focus({ preventScroll: true });
@@ -3153,14 +2401,11 @@ export class AccessibilityScanner {
               element!.removeAttribute("data-accessibility-evidence");
             };
           }
-          return { found: true, visible: isVisible, selector: selectedSelector, affectedElements: uniqueLabels };
+          return { found: true, visible, selector: selectedSelector };
         }, { selectors, ruleId: issue.ruleId });
 
         if (!captured?.found) continue;
         if (captured.selector) issue.selector = captured.selector;
-        if (captured.affectedElements?.length) {
-          issue.affectedElements = this.unique([...(issue.affectedElements || []), ...captured.affectedElements]).slice(0, 40);
-        }
         await page.waitForTimeout(150);
         const buf = await page.screenshot({ type: "jpeg", quality: 68, fullPage: false });
         issue.evidenceScreenshot = `data:image/jpeg;base64,${buf.toString("base64")}`;
@@ -3242,10 +2487,10 @@ export class AccessibilityScanner {
       const groupingSelector = this.groupingKeyForIssue(issue, normalizedSelector);
       const key = [
         issue.ruleId,
-        this.scanPageKeyWithoutState(issue.url),
-        groupingSelector,
-        this.normalizeMessage(issue.message),
-      ].join("|");
+        issue.url,
+        issue.state || "default",
+        issue.phase || "initial",
+        groupingSelector,      ].join("|");
 
       const existing = map.get(key);
       if (!existing) {
@@ -3255,7 +2500,6 @@ export class AccessibilityScanner {
           selectors: selectors.length ? selectors : issue.selectors,
           depths: issue.depths,
           affectedCount: Math.max(issue.affectedCount || 0, selectors.length || 1),
-          affectedElements: issue.affectedElements,
         });
         continue;
       }
@@ -3271,7 +2515,6 @@ export class AccessibilityScanner {
       existing.act = this.unique([...(existing.act || []), ...(issue.act || [])]);
       existing.tags = this.unique([...(existing.tags || []), ...(issue.tags || [])]);
       existing.affectedCount = Math.max(existing.affectedCount || 1, mergedSelectors.length, issue.affectedCount || 1);
-      existing.affectedElements = this.unique([...(existing.affectedElements || []), ...(issue.affectedElements || [])]).slice(0, 40);
       existing.evidenceScreenshot = existing.evidenceScreenshot || issue.evidenceScreenshot;
       existing.evidenceExplanation = existing.evidenceExplanation || issue.evidenceExplanation;
     }
@@ -3296,7 +2539,7 @@ export class AccessibilityScanner {
   private generateTestCases(): void {
     const seen = new Set<string>();
     for (const issue of this.allIssues) {
-      const key = `${issue.ruleId}|${this.scanPageKeyWithoutState(issue.url)}`;
+      const key = `${issue.ruleId}|${issue.url}`;
       if (seen.has(key)) continue;
       seen.add(key);
       this.testCases.push({
@@ -3318,376 +2561,124 @@ export class AccessibilityScanner {
     const urls = [...new Set([...seedUrls, ...this.allIssues.map(i => i.url).filter(Boolean)])];
     if (!urls.length) return;
 
-    const reviews: TestCase[] = [];
-    const issuesByUrl = new Map<string, ScanIssue[]>();
-    for (const issue of this.allIssues) {
-      const issueUrl = issue.url || "current page";
-      if (!issuesByUrl.has(issueUrl)) issuesByUrl.set(issueUrl, []);
-      issuesByUrl.get(issueUrl)!.push(issue);
-    }
+    const allIssueText = this.allIssues.map(i => `${i.category || ""} ${i.message} ${i.selector || ""} ${i.state || ""} ${i.phase || ""}`).join(" ");
+    const categories = new Set(this.allIssues.map(i => i.category).filter(Boolean));
+    const hasKeyboardRisk = categories.has("keyboard") || categories.has("focus");
+    const hasFormRisk = /label|error|input|form/i.test(allIssueText);
+    const hasDynamicRisk = /expanded|hover|focus|error|tab-active|interaction|modal|menu|accordion|tab/i.test(allIssueText);
+    const hasMediaRisk = /video|audio|caption|transcript|media/i.test(allIssueText);
+    const pageList = urls.map(url => `- ${url}`).join("\n");
+    const pagesSummary = `${urls.length} scanned page${urls.length === 1 ? "" : "s"}`;
 
-    const snapshotPhasesByUrl = new Map<string, Set<string>>();
-    for (const snapshot of this.domSnapshots) {
-      const snapshotUrl = snapshot.url || "current page";
-      if (!snapshotPhasesByUrl.has(snapshotUrl)) snapshotPhasesByUrl.set(snapshotUrl, new Set());
-      if (snapshot.phase) snapshotPhasesByUrl.get(snapshotUrl)!.add(snapshot.phase);
-    }
-
-    const hasSignal = (text: string, pattern: RegExp) => pattern.test(text);
-    const pageTitle = (url: string) => url.includes("#") ? decodeURIComponent(url.split("#").pop() || url) : url;
-    const addPageReview = (review: TestCase) => {
-      const key = `${review.name}|${review.issueUrl || review.description}`;
-      if (reviews.some(existing => `${existing.name}|${existing.issueUrl || existing.description}` === key)) return;
-      reviews.push(review);
-    };
-
-    for (const url of urls) {
-      const pageIssues = issuesByUrl.get(url) || [];
-      const issueText = pageIssues.map(i => `${i.ruleId} ${i.category || ""} ${i.message} ${i.selector || ""} ${i.state || ""} ${i.phase || ""}`).join(" ");
-      const phaseText = Array.from(snapshotPhasesByUrl.get(url) || []).join(" ");
-      const combinedText = `${issueText} ${phaseText}`;
-      const label = pageTitle(url);
-      const titleSuffix = label && !/^https?:\/\//i.test(label) ? `: ${label}` : "";
-
-      const issueHas = (pattern: RegExp) => pageIssues.some(issue => pattern.test(`${issue.ruleId} ${issue.category || ""} ${issue.message} ${issue.selector || ""} ${issue.state || ""} ${issue.phase || ""}`));
-      const phaseHas = (pattern: RegExp) => pattern.test(phaseText);
-
-      const hasScreenReaderRisk = issueHas(/aria|role|name|label|landmark|heading|status-message|document-title|html-has-lang|image-alt|button-name|link-name|input|focus/i);
-      const hasContentMeaningRisk = issueHas(/image-alt|link-name|button-name|label|heading|document-title|instructions?|empty|ambiguous|text-alternative|alt/i);
-      const hasKeyboardRisk = issueHas(/keyboard|focus|tab-order|shift|escape|arrow|trap|mouse-only|target-size/i) || phaseHas(/keyboard|focus/i);
-      const hasDynamicRisk = issueHas(/expanded|modal|dialog|menu|accordion|popover|drawer|sidebar|overlay|aria-expanded|tabpanel|state:/i) || phaseHas(/expanded|error|tab-|interaction|side-panel|modal|dialog|drawer|sidebar/i);
-      const hasResponsiveRisk = issueHas(/reflow|zoom|viewport|mobile|target-size|pointer|touch|truncation|overlap|orientation|fixed-font-size/i) || phaseHas(/zoom|pointer/i);
-      const hasFormRisk = issueHas(/form|forms|input|field|label|error|invalid|required|autocomplete|status-message|aria-errormessage/i) || phaseHas(/error/i);
-      const hasMediaRisk = issueHas(/video|audio|caption|transcript|media|player|autoplay/i);
-
-      if (hasScreenReaderRisk) {
-        addPageReview({
-          name: `Screen reader review${titleSuffix}`,
-          description: `Manual screen reader review is applicable because this page/screen has programmatic structure, focus, ARIA, label, or announcement signals from the scan: ${url}`,
+    const reviews: TestCase[] = [
+        {
+          name: `Screen reader reading order and announcements`,
+          description: `Manual review still required for screen reader experience across ${pagesSummary}:\n${pageList}`,
           category: "manual-review",
           wcagRef: "WCAG 1.3.2 / 4.1.2",
           status: "pending",
-          issueUrl: url,
           steps: [
-            "Open this specific scanned page or state with NVDA, JAWS, or VoiceOver.",
-            "Navigate by headings, landmarks, links, buttons, and form controls that exist on this screen.",
-            "Confirm announced names, roles, states, and reading order match the visible interface."
+            "Open each scanned page listed in this test case with NVDA, JAWS, or VoiceOver.",
+            "Navigate by headings, landmarks, links, buttons, and form controls.",
+            "Confirm the announced names, roles, states, and reading order match the visual interface.",
+            "Verify dynamic updates are announced without forcing users to rediscover the page."
           ],
-          result: "Manual review required for this page because automated findings indicate screen-reader-relevant structure or state."
-        });
-      }
-
-      if (hasContentMeaningRisk) {
-        addPageReview({
-          name: `Content meaning and labels${titleSuffix}`,
-          description: `Human judgment is applicable because this page/screen has labels, links, buttons, headings, images, or instruction-related signals: ${url}`,
+          result: "Manual review required - automated DOM and axe checks cannot fully validate real assistive technology behavior."
+        },
+        {
+          name: `Content meaning, labels, and instructions`,
+          description: `Human judgment required for labels, instructions, link purpose, alt text quality, and content clarity across ${pagesSummary}:\n${pageList}`,
           category: "manual-review",
           wcagRef: "WCAG 1.1.1 / 2.4.4 / 3.3.2",
           status: "pending",
-          issueUrl: url,
           steps: [
-            "Review only the visible text, controls, links, image alternatives, and instructions on this page/state.",
-            "Confirm names are meaningful for the actual task, not merely present.",
-            "Check that page-specific content such as product details, prices, help text, errors, or legal content is understandable."
+            "Review link text, button names, headings, instructions, and image alternatives in context.",
+            "Confirm names are not only present but meaningful for the task.",
+            "Check that errors, help text, prices, product details, and legal or transactional content are understandable."
           ],
-          result: "Manual review required for this page because automation cannot judge whether the available text is meaningful in context."
-        });
-      }
-
-      if (hasKeyboardRisk) {
-        addPageReview({
-          name: `Keyboard-only flow${titleSuffix}`,
-          description: `Hybrid keyboard validation is applicable because keyboard, focus, tab order, or target interaction signals were found on this page/screen: ${url}`,
+          result: "Manual review required - automation can detect missing attributes, not whether the language is correct or useful."
+        },
+        {
+          name: `Keyboard-only task flow`,
+          description: `Hybrid keyboard validation for realistic user tasks across ${pagesSummary}:\n${pageList}`,
           category: "hybrid-review",
           wcagRef: "WCAG 2.1.1 / 2.4.3 / 2.1.2",
           status: "pending",
-          issueUrl: url,
           steps: [
-            "Use only keyboard on this page/state for the controls present here.",
+            "Use only keyboard to complete the main page task from start to finish.",
             "Verify Tab, Shift+Tab, Enter, Space, Escape, and arrow-key behavior where applicable.",
-            "Confirm focus order is logical, visible, and does not skip or trap important controls."
+            "Confirm focus order is logical, visible, and does not skip or trap important controls.",
+            hasKeyboardRisk
+              ? "Pay special attention to keyboard/focus issues already flagged by the automated scan."
+              : "Confirm no task-critical keyboard issue exists beyond the sampled automated checks."
           ],
-          result: "Hybrid review required for this page because automated keyboard/focus sampling found applicable interaction signals."
-        });
-      }
-
-      if (hasDynamicRisk) {
-        addPageReview({
-          name: `Dynamic state coverage${titleSuffix}`,
-          description: `Hybrid dynamic-state review is applicable because this page/screen includes scanned state, overlay, sidebar, menu, tab, modal, or interaction signals: ${url}`,
+          result: "Hybrid review required - automated keyboard simulation is sampled and cannot prove every business flow."
+        },
+        {
+          name: `Dynamic interaction state coverage`,
+          description: `Hybrid review for menus, modals, filters, accordions, tabs, validation, and route changes across ${pagesSummary}:\n${pageList}`,
           category: "hybrid-review",
           wcagRef: "WCAG 4.1.2 / 2.4.3 / 3.3.1",
           status: "pending",
-          issueUrl: url,
           steps: [
-            "Review the specific dynamic state represented by this scanned URL/state.",
-            "Confirm focus moves correctly into and out of the visible overlay, drawer, menu, tab, or changed content.",
-            "Verify expanded, selected, disabled, error, or updated states are exposed correctly where present."
+            "Open all task-critical menus, dialogs, popovers, filters, accordions, tabs, carts, and validation states.",
+            "Confirm focus moves correctly into and out of overlays.",
+            "Verify expanded/collapsed state, selected state, error state, and disabled state are exposed to assistive tech.",
+            hasDynamicRisk
+              ? "Review the states where the automated scan already found issues first."
+              : "Use this as a coverage pass because the automated scan samples representative states, not a full state graph."
           ],
-          result: "Hybrid review required for this page/state because dynamic interaction evidence exists in the scan."
-        });
-      }
-
-      if (hasResponsiveRisk) {
-        addPageReview({
-          name: `Responsive zoom and touch${titleSuffix}`,
-          description: `Manual responsive/touch review is applicable because reflow, zoom, viewport, touch target, or truncation signals were found on this page/screen: ${url}`,
+          result: "Hybrid review required - this version samples states but does not exhaustively build a full UI state graph."
+        },
+        {
+          name: `Responsive zoom and touch usability`,
+          description: `Manual review for mobile, 200-400% zoom, touch target usability, and orientation behavior across ${pagesSummary}:\n${pageList}`,
           category: "manual-review",
           wcagRef: "WCAG 1.4.10 / 1.4.4 / 2.5.8",
           status: "pending",
-          issueUrl: url,
           steps: [
-            "Test this page/state at 200% and 400% browser zoom and common mobile viewport sizes.",
-            "Check that content in this screen is not hidden, overlapping, clipped, or requiring unexpected two-dimensional scrolling.",
-            "Use touch or device emulation for the controls present on this screen."
+            "Test at 200% and 400% browser zoom and common mobile viewport sizes.",
+            "Check that content is not hidden, overlapping, or requiring two-dimensional scrolling except where allowed.",
+            "Use touch or device emulation to verify target spacing and gesture alternatives.",
+            "Confirm sticky headers, cookie banners, chat widgets, and overlays do not obscure content."
           ],
-          result: "Manual review required for this page because automated responsive/touch checks found applicable layout or target signals."
-        });
-      }
+          result: "Manual review required - automated reflow/target checks need visual and device confirmation."
+        }
+      ];
 
       if (hasFormRisk) {
-        addPageReview({
-          name: `Form completion and error recovery${titleSuffix}`,
-          description: `Hybrid form validation review is applicable because form, field, label, error, required, or status-message signals were found on this page/screen: ${url}`,
+        reviews.push({
+          name: `Form completion and error recovery`,
+          description: `Hybrid form validation review across ${pagesSummary}:\n${pageList}`,
           category: "hybrid-review",
           wcagRef: "WCAG 3.3.1 / 3.3.2 / 3.3.3",
           status: "pending",
-          issueUrl: url,
           steps: [
-            "Submit only the forms present on this page/state with empty, invalid, and corrected values.",
-            "Confirm errors are visible, announced, associated with the relevant fields, and easy to recover from.",
-            "Verify required fields, formatting rules, autocomplete, and success messages for this screen."
+            "Submit forms with empty, invalid, and corrected values.",
+            "Confirm errors are visible, announced, associated with fields, and easy to recover from.",
+            "Verify required fields, formatting rules, autocomplete, and success messages are clear."
           ],
-          result: "Hybrid review required for this page because form/error evidence exists in the scan."
+          result: "Hybrid review required - automated checks can trigger some errors but cannot validate the full recovery experience."
         });
       }
 
       if (hasMediaRisk) {
-        addPageReview({
-          name: `Media alternatives and player accessibility${titleSuffix}`,
-          description: `Manual media review is applicable because media/player/caption/transcript signals were found on this page/screen: ${url}`,
+        reviews.push({
+          name: `Media alternatives and player accessibility`,
+          description: `Manual captions, transcript, audio description, and player control review across ${pagesSummary}:\n${pageList}`,
           category: "manual-review",
           wcagRef: "WCAG 1.2.x",
           status: "pending",
-          issueUrl: url,
           steps: [
-            "Verify captions, transcripts, and audio descriptions for media on this page/state.",
-            "Confirm media controls on this screen are keyboard accessible and screen-reader announced.",
-            "Check autoplay, pause, stop, volume, and motion behavior where present."
+            "Verify captions, transcripts, and audio descriptions for all meaningful media.",
+            "Confirm media controls are keyboard accessible and screen-reader announced.",
+            "Check autoplay, pause, stop, volume, and motion behavior."
           ],
-          result: "Manual review required for this page because media-related evidence exists in the scan."
+          result: "Manual review required - media quality and synchronization cannot be reliably proven by the scanner."
         });
       }
-    }
 
       this.testCases.push(...reviews);
-  }
-
-  private generateTestProcedureCoverage(opts: ScanOptions): void {
-    const rawSteps = (Array.isArray(opts.test_procedure_steps) ? opts.test_procedure_steps : [])
-      .map(step => String(step || "").replace(/^\s*\d+[\).:-]?\s*/, "").trim())
-      .filter(Boolean)
-      .slice(0, 80);
-    if (!rawSteps.length) return;
-
-    const coverageSteps: TestProcedureStepCoverage[] = rawSteps.map((step, index) => {
-      const mapped = this.mapProcedureStep(step);
-      return {
-        stepNumber: index + 1,
-        stepText: step,
-        coverageType: mapped.coverageType,
-        scannerModule: mapped.scannerModule,
-        status: mapped.status,
-        evidence: mapped.evidence,
-      };
-    });
-
-    const totals = coverageSteps.reduce((acc: Record<string, number>, step) => {
-      acc[step.coverageType] = (acc[step.coverageType] || 0) + 1;
-      acc[step.status] = (acc[step.status] || 0) + 1;
-      return acc;
-    }, {});
-
-    const hasFailures = coverageSteps.some(step => step.status === "fail");
-    const allAutomatedPassed = coverageSteps
-      .filter(step => step.coverageType === "automated")
-      .every(step => step.status === "pass");
-
-    this.testCases.unshift({
-      name: "Test Procedure Coverage",
-      description: `Mapped ${coverageSteps.length} provided business test step${coverageSteps.length === 1 ? "" : "s"} to scanner coverage. Automated: ${totals.automated || 0}, hybrid: ${totals.hybrid || 0}, manual: ${totals.manual || 0}.`,
-      category: "hybrid-review",
-      wcagRef: "Procedure coverage",
-      status: hasFailures ? "fail" : allAutomatedPassed && !(totals.hybrid || totals.manual) ? "pass" : "pending",
-      steps: coverageSteps,
-      result: `Coverage summary: ${(totals.pass || 0)} passed, ${(totals.fail || 0)} failed, ${(totals.pending || 0)} need review. Expand this case to review step-level coverage.`,
-    });
-  }
-
-  private async scanExcelProcedureSteps(
-    page: any,
-    baseUrl: string,
-    opts: ScanOptions,
-    extraStates: StateConfig[],
-    progress: (msg: string) => void,
-    scannedKeys: Set<string>,
-    authConfig: any
-  ): Promise<void> {
-    const rows = this.normalizedExcelProcedureSteps(opts);
-    if (!rows.length) return;
-
-    const executed: string[] = [];
-    let scannedCount = 0;
-    let blockedCount = 0;
-
-    progress(`Executing uploaded Excel procedure with ${rows.length} step${rows.length === 1 ? "" : "s"}`);
-
-    for (const row of rows) {
-      const label = this.excelStepLabel(row);
-      try {
-        if (row.action === "navigate-url" && row.url) {
-          progress(`Excel step ${row.stepNumber}: navigate to ${row.url}`);
-          const ok = await this.navigateAndRecord(page, row.url, `excel procedure step ${row.stepNumber}`);
-          if (!ok) throw new Error(`URL is unreachable: ${row.url}`);
-          await this.waitAfterTargetStep(page, authConfig, progress, label);
-          executed.push(`Step ${row.stepNumber}: navigated to ${row.url}.`);
-        } else if (row.action === "navigation-path" && row.path?.length) {
-          progress(`Excel step ${row.stepNumber}: follow navigation path ${row.path.join(" > ")}`);
-          for (const pathPart of row.path) {
-            const part = String(pathPart || "").trim();
-            if (!part || /^(accesso|login|home)$/i.test(part)) continue;
-            const clicked = await this.clickByVisibleText(page, part);
-            if (!clicked) throw new Error(`Navigation item not found: ${part}`);
-            await this.waitAfterTargetStep(page, authConfig, progress, part);
-          }
-          executed.push(`Step ${row.stepNumber}: followed navigation path ${row.path.join(" > ")}.`);
-        } else if (row.action === "click" && row.targetText) {
-          progress(`Excel step ${row.stepNumber}: click ${row.targetText}`);
-          const clicked = await this.clickByVisibleText(page, row.targetText);
-          if (!clicked) {
-            await this.prepareTargetLaunchPage(page, label, progress);
-            const retry = await this.clickTargetInteraction(page, {
-              base_page: baseUrl,
-              name: row.targetText,
-              text: row.targetText,
-              click_type: "any",
-            });
-            if (!retry) throw new Error(`Click target not found: ${row.targetText}`);
-          }
-          await this.waitAfterTargetStep(page, authConfig, progress, row.targetText);
-          executed.push(`Step ${row.stepNumber}: clicked ${row.targetText}.`);
-        } else if (row.action === "scan") {
-          progress(`Excel step ${row.stepNumber}: scan current procedure state`);
-          executed.push(`Step ${row.stepNumber}: scanned current page/state.`);
-        } else {
-          executed.push(`Step ${row.stepNumber}: kept for manual review.`);
-          continue;
-        }
-
-        if (row.scanAfterStep !== false || row.action === "scan") {
-          const currentUrl = this.currentTargetUrl(page, baseUrl, `excel-step-${row.stepNumber}`);
-          const scanned = await this.scanTargetDestinationOnce(page, currentUrl, opts, extraStates, progress, scannedKeys, `excel-procedure:${row.stepNumber}`);
-          if (scanned) scannedCount++;
-          scannedCount += await this.scanDiscoveredSidebarDestinations(page, currentUrl, opts, extraStates, progress, scannedKeys, `excel-step-${row.stepNumber}`, authConfig);
-        }
-      } catch (err) {
-        blockedCount++;
-        const message = (err as Error)?.message || String(err);
-        progress(`WARN: Excel step ${row.stepNumber} could not be executed: ${message}`);
-        executed.push(`Step ${row.stepNumber}: blocked - ${message}.`);
-        logger.warn(`Excel procedure step ${row.stepNumber} failed:`, err);
-      }
-    }
-
-    this.testCases.push({
-      name: "Excel procedure journey scan",
-      description: "The scanner executed navigable rows from the uploaded Excel procedure and scanned the reached pages/states.",
-      category: "hybrid-review",
-      wcagRef: "Procedure execution",
-      status: blockedCount ? "pending" : scannedCount > 0 ? "pass" : "pending",
-      issueUrl: page.url(),
-      steps: executed,
-      result: `Excel procedure execution completed; ${scannedCount} page/state scan${scannedCount === 1 ? "" : "s"} captured, ${blockedCount} step${blockedCount === 1 ? "" : "s"} need review.`
-    });
-  }
-
-  private normalizedExcelProcedureSteps(opts: ScanOptions): ExcelProcedureStep[] {
-    return (Array.isArray(opts.excel_procedure_steps) ? opts.excel_procedure_steps : [])
-      .map((row, index) => ({
-        stepNumber: Number(row.stepNumber) || index + 1,
-        expected: String(row.expected || "").trim(),
-        actual: String(row.actual || "").trim(),
-        action: row.action || "manual",
-        url: String(row.url || "").trim() || undefined,
-        path: Array.isArray(row.path) ? row.path.map(part => String(part || "").trim()).filter(Boolean) : [],
-        targetText: String(row.targetText || "").trim() || undefined,
-        scanAfterStep: row.scanAfterStep !== false,
-      }))
-      .filter(row => row.expected || row.actual || row.url || row.path.length || row.targetText)
-      .slice(0, 120);
-  }
-
-  private excelStepLabel(row: ExcelProcedureStep): string {
-    return row.targetText || row.path?.join(" > ") || row.url || row.expected || `Excel step ${row.stepNumber}`;
-  }
-
-  private mapProcedureStep(step: string): Pick<TestProcedureStepCoverage, "coverageType" | "scannerModule" | "status" | "evidence"> {
-    const text = step.toLowerCase();
-    const issueText = this.allIssues.map(issue => `${issue.ruleId} ${issue.category || ""} ${issue.message}`).join(" ").toLowerCase();
-    const hasIssue = (pattern: RegExp) => pattern.test(issueText);
-    const moduleEnabled = (label: string) => `${label} module executed during this scan.`;
-
-    if (/credential|login|otp|precondition|navigate to .*url|enter credentials/.test(text)) {
-      return { coverageType: "automated", scannerModule: "Authentication workflow", status: "pass", evidence: "The scanner completed configured navigation/login before protected page scans." };
-    }
-    if (/navigate.*(menu|app|accesso|impostazioni|dispositivi|gestisci)|click|button|link|promo|card/.test(text)) {
-      return { coverageType: "hybrid", scannerModule: "Configured page navigation / targeted interactions", status: "pending", evidence: "Navigation can be automated when represented by selected pages or targeted interaction configuration; confirm business-path correctness." };
-    }
-    if (/keyboard only|tab|shift\+?tab|focus order|logical focus/.test(text)) {
-      const failed = hasIssue(/keyboard|focus:trap|tab-order/);
-      return { coverageType: "automated", scannerModule: "Keyboard navigation", status: failed ? "fail" : "pass", evidence: failed ? "Keyboard/focus issues were detected and linked in the Issues tab." : moduleEnabled("Keyboard navigation") };
-    }
-    if (/visible focus|focus indicator|focused elements/.test(text)) {
-      const failed = hasIssue(/focus:invisible|focus indicator|color:focus/);
-      return { coverageType: "automated", scannerModule: "Focus visibility", status: failed ? "fail" : "pass", evidence: failed ? "Focus visibility issues were detected." : moduleEnabled("Focus visibility") };
-    }
-    if (/focus.*trap|trapped|move away|escape/.test(text)) {
-      const failed = hasIssue(/focus:trap|escape-key|keyboard/);
-      return { coverageType: "automated", scannerModule: "Focus trap checks", status: failed ? "fail" : "pass", evidence: failed ? "Potential focus trap or escape-key issues were detected." : moduleEnabled("Focus trap") };
-    }
-    if (/screen reader|announced|assistive technolog|accessible name|names?[, ]+roles?/.test(text)) {
-      const failed = hasIssue(/aria|label|role|name|status-message/);
-      return { coverageType: "hybrid", scannerModule: "axe-core, accessibility tree, ARIA/name checks", status: failed ? "fail" : "pending", evidence: failed ? "Programmatic name/role/state issues were detected; real screen reader confirmation is still required." : "Automation collected accessibility tree evidence; real screen reader announcement quality remains a hybrid/manual confirmation." };
-    }
-    if (/heading|label|relationship|structure|programmatic/.test(text)) {
-      const failed = hasIssue(/heading|label|landmark|aria|required-children|structure/);
-      return { coverageType: "hybrid", scannerModule: "Structure, landmarks, labels, ARIA checks", status: failed ? "fail" : "pending", evidence: failed ? "Structural or labeling issues were detected." : "Automated DOM/ARIA checks ran; semantic correctness should be reviewed in context." };
-    }
-    if (/contrast|minimum color|text.*icons/.test(text)) {
-      const failed = hasIssue(/contrast|color/);
-      return { coverageType: "automated", scannerModule: "Color contrast", status: failed ? "fail" : "pass", evidence: failed ? "Contrast issues were detected." : moduleEnabled("Color contrast") };
-    }
-    if (/color alone|conveyed by color/.test(text)) {
-      return { coverageType: "hybrid", scannerModule: "Color and visual heuristic review", status: "pending", evidence: "Automation can detect some color/contrast risks, but meaning conveyed by color alone requires visual review." };
-    }
-    if (/form field|error message|required|error/.test(text)) {
-      const failed = hasIssue(/input|label|error|form|status-message/);
-      return { coverageType: "hybrid", scannerModule: "Form label and error heuristics", status: failed ? "fail" : "pending", evidence: failed ? "Form/error issues were detected." : "Form heuristics ran; confirm submitted error states in the business flow." };
-    }
-    if (/status message|alert|dynamically updated|updated content/.test(text)) {
-      const failed = hasIssue(/status-message|aria-live|alert/);
-      return { coverageType: "hybrid", scannerModule: "Status message heuristics", status: failed ? "fail" : "pending", evidence: failed ? "Status announcement risks were detected." : "Automation checked common live-region patterns; screen reader confirmation remains recommended." };
-    }
-    if (/text scaling|reflow|200%|400%|zoom|mobile|display zoom|font scaling/.test(text)) {
-      const failed = hasIssue(/reflow|viewport|zoom|target-size|truncation/);
-      return { coverageType: "automated", scannerModule: "Zoom, reflow, viewport and pointer checks", status: failed ? "fail" : "pass", evidence: failed ? "Zoom/reflow/touch risks were detected." : moduleEnabled("Zoom/reflow") };
-    }
-    if (/title|screen name|page title/.test(text)) {
-      const failed = hasIssue(/title|document-title|page-has-heading-one|h1|heading/);
-      return { coverageType: "automated", scannerModule: "Document title and heading heuristics", status: failed ? "fail" : "pass", evidence: failed ? "Page title or heading risks were detected." : "Document title and heading heuristics completed." };
-    }
-
-    return { coverageType: "manual", scannerModule: "Manual review", status: "pending", evidence: "No reliable automated mapping exists for this step; keep it as a tester confirmation item." };
   }
 
   private computeScore(issues: ScanIssue[]): number {
