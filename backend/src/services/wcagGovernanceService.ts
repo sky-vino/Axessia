@@ -305,7 +305,6 @@ async function upsertReview(ruleId: string, currentWcag: string[], suggestedWcag
     );
     return;
   }
-
   try {
     await db.query(
       `INSERT INTO wcag_mapping_reviews (rule_id, current_wcag, suggested_wcag, reason, status, first_seen_at, last_seen_at)

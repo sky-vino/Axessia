@@ -6,7 +6,7 @@ name: Build and deploy Node.js app to Azure Web App - axessia-app
 on:
   push:
     branches:
-      - main
+      - test-fix-branch
   workflow_dispatch:
 
 jobs:
@@ -45,9 +45,9 @@ jobs:
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_65603265E315467F872157E96E5D978C }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_6072A314B2484EBFAF0581441198D559 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_BFE5597DCEE84607B3B94BF1E72CBD21 }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_10192DD0D37C4B9DA68A1988108D52CC }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_CDF3A0946F2149DA9CBBD85063228B54 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_1B6CDC2F730442E09B607CD5F60B432F }}
 
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
