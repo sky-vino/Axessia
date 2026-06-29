@@ -550,17 +550,12 @@ export class AccessibilityScanner {
       const field = findDeep(document, "#sky-login-email")
         || findDeep(document, "input[id='sky-login-email']");
       return isLaidOut(field);
-    }, { timeout: 25000 }).then(() => true).catch(() => false);
+   }, { timeout: 25000 }).then(() => true).catch(() => false);
 
-<<<<<<< HEAD
     // Settle so the web component finishes wiring its value listeners before we type.
     await page.waitForTimeout(fieldReady ? 800 : 1500).catch(() => undefined);
   }
-  // ── DIAGNOSTIC waitForOtpPage ─────────────────────────────────────────────
-  // Logs URL changes and page state every 5 polls; on timeout, captures a
-  // screenshot and lists visible controls + any Italian/English error message,
-  // so Azure failures are debuggable from log stream alone instead of guessing.
-=======
+
   private explicitLoginUrlForTarget(auth: any, targetUrl?: string): string {
     const configuredLoginUrl = String(auth?.login_url || "").trim();
     if (!configuredLoginUrl) return "";
@@ -592,7 +587,6 @@ export class AccessibilityScanner {
     }
   }
 
->>>>>>> e639d05577348a84803ab54fbfd48085e4af6a3c
   private async waitForOtpPage(page: any, auth: any, timeout = 30000): Promise<void> {
     const otpSelector = this.authSelector(auth, "otp_selector");
     const otpSourceSelector = this.authSelector(auth, "otp_source_selector");
