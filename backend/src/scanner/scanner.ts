@@ -552,6 +552,10 @@ private async locateAuthFieldBox(
       return isLaidOut(field);
     }, { timeout: 25000 }).then(() => true).catch(() => false);
 
+    // Settle so the web component finishes wiring its value listeners before we type.
+    await page.waitForTimeout(fieldReady ? 800 : 1500).catch(() => undefined);
+  }
+
   private explicitLoginUrlForTarget(auth: any, targetUrl?: string): string {
     const configuredLoginUrl = String(auth?.login_url || "").trim();
     if (!configuredLoginUrl) return "";
@@ -582,6 +586,7 @@ private async locateAuthFieldBox(
       return false;
     }
   }
+
 
   private async waitForOtpPage(page: any, auth: any, timeout = 30000): Promise<void> {
     const otpSelector = this.authSelector(auth, "otp_selector");
