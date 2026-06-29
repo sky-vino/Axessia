@@ -1,20 +1,15 @@
-# Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
-# More GitHub Actions for Azure: https://github.com/Azure/actions
-
+# Build and deploy Node.js app to Azure Web App - axessia-app
 name: Build and deploy Node.js app to Azure Web App - axessia-app
-
 on:
   push:
     branches:
       - main
   workflow_dispatch:
-
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read #This is required for actions/checkout
-
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -22,6 +17,18 @@ jobs:
         uses: actions/setup-node@v3
         with:
           node-version: '22.x'
+
+      - name: Build backend (install + compile TypeScript)
+        run: |
+          cd backend
+          npm ci
+          npm run build
+
+      - name: Build frontend (install + bundle)
+        run: |
+          cd frontend
+          npm ci
+          npm run build
 
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
@@ -33,21 +40,20 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     permissions:
-      id-token: write #This is required for requesting the JWT
-      contents: read #This is required for actions/checkout
-
+      id-token: write
+      contents: read
     steps:
       - name: Download artifact from build job
         uses: actions/download-artifact@v4
         with:
           name: node-app
-      
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_65603265E315467F872157E96E5D978C }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_6072A314B2484EBFAF0581441198D559 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_BFE5597DCEE84607B3B94BF1E72CBD21 }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_F3859744C07C48A3B6EADD10D9F81C96 }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_CECA326C6C9946929168372173AB4A07 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_D504AF1AA1EC4977A908FD96A13E29F8 }}
 
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
@@ -56,4 +62,3 @@ jobs:
           app-name: 'axessia-app'
           slot-name: 'Production'
           package: .
-          
