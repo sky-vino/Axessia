@@ -362,8 +362,6 @@ private async locateAuthFieldBox(
     fieldHint: "username" | "password" = "username"
   ): Promise<{ x: number; y: number } | null> {
     // Wait until the closed-root host actually has a rendered, non-zero box.
-    // The previous failure was this returning null because the host was not
-    // measurable yet on the Azure container — not a wrong offset.
     const hostBox = await page.waitForFunction(() => {
       const host = document.querySelector("sky-login-component#sky-login");
       if (!host) return null;
@@ -374,15 +372,43 @@ private async locateAuthFieldBox(
       .then((handle: any) => handle.jsonValue())
       .catch(() => null);
 
-    if (!hostBox) return null;
+    if (!hostBox) {
+      // DIAGNOSTIC: the host with that exact selector was not measurable.
+      // Capture what the page actually contains so we know WHY: iframe?
+      // renamed component? not laid out? This logs once, then returns null.
+      try {
+        const diag = await page.evaluate(() => {
+          const bySelector = !!document.querySelector("sky-login-component#sky-login");
+          const anySkyLogin = Array.from(document.querySelectorAll("sky-login-component"))
+            .map(el => ({ id: el.id || "(no id)", rect: (() => { const r = el.getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height) }; })() }));
+          const customEls = Array.from(new Set(
+            Array.from(document.querySelectorAll("*"))
+              .map(el => el.tagName.toLowerCase())
+              .filter(tag => tag.includes("-"))
+          )).slice(0, 40);
+          const iframeCount = document.querySelectorAll("iframe").length;
+          return {
+            url: location.href,
+            matchedExactSelector: bySelector,
+            skyLoginComponents: anySkyLogin,
+            iframeCount,
+            customElements: customEls,
+          };
+        }).catch(() => null);
 
-    // The email and password inputs are visually stacked inside the host.
-    // Measured separation (your console capture): password sat ~86px below
-    // email within a ~224px-tall host => ~0.38 of host height between them,
-    // with email centred in the upper portion (~0.20 of host height down).
+        const frameUrls = (typeof page.frames === "function" ? page.frames() : [])
+          .map((f: any) => { try { return f.url(); } catch { return "(unknown)"; } });
+
+        logger.warn(`locateAuthFieldBox could not measure sky-login host. Page diagnostic: ${JSON.stringify(diag)}; frameUrls: ${JSON.stringify(frameUrls)}`);
+      } catch (err) {
+        logger.warn(`locateAuthFieldBox diagnostic capture failed: ${(err as Error)?.message || err}`);
+      }
+      return null;
+    }
+
     const x = hostBox.x + hostBox.width / 2;
     const emailY = hostBox.y + hostBox.height * 0.20;
-    const passwordY = hostBox.y + hostBox.height * 0.58; // 0.20 + 0.38
+    const passwordY = hostBox.y + hostBox.height * 0.58;
 
     return { x, y: fieldHint === "password" ? passwordY : emailY };
   }
