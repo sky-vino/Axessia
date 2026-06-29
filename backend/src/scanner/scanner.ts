@@ -274,13 +274,14 @@ export class AccessibilityScanner {
       // type. Focus delegates into the closed root (active tag = LOGIN-INPUT),
       // so keystrokes reach the real input. We verify success by the login
       // form going away / URL advancing, NOT by reading the (invisible) value.
-      const usernameTyped = await this.keyboardLoginByClick(page, usernameSelector, auth.username || "");
+      const usernameTyped = await this.keyboardLoginByClick(page, usernameSelector, auth.username || "", "username");
+
       if (!usernameTyped) {
         throw new Error(`Login username field could not be focused/typed (closed shadow root) with selector: ${usernameSelector}`);
       }
       this.onProgress(12, "SUCCESS: Username entered");
 
-      const passwordTyped = await this.keyboardLoginByClick(page, passwordSelector, auth.password || "");
+      const passwordTyped = await this.keyboardLoginByClick(page, passwordSelector, auth.password || "", "password");
       if (!passwordTyped) {
         throw new Error(`Login password field could not be focused/typed (closed shadow root) with selector: ${passwordSelector}`);
       }
@@ -319,13 +320,14 @@ export class AccessibilityScanner {
   // Closed-shadow-root login: click the field's screen position so focus
   // delegates into the component's internal input, then type via the keyboard.
   // Returns false only if the field's box can't be located on screen.
-  private async keyboardLoginByClick(page: any, selectorList: string | undefined, value: string): Promise<boolean> {
+ private async keyboardLoginByClick(
+    page: any,
+    selectorList: string | undefined,
+    value: string,
+    fieldHint: "username" | "password" = "username"
+  ): Promise<boolean> {
     if (!value) return false;
-
-    // Find the on-screen rectangle of the closed-root field WITHOUT needing
-    // DOM access to it: ask the host component for its bounding box. The host
-    // (<sky-login-component>) is reachable; its rendered box contains the field.
-    const box = await this.locateAuthFieldBox(page, selectorList);
+    const box = await this.locateAuthFieldBox(page, selectorList, fieldHint);
     if (!box) return false;
 
     // Click slightly inside the field area; focus delegates into the closed root.
@@ -354,37 +356,35 @@ export class AccessibilityScanner {
   // Returns the viewport-centre coordinates of the field to click. It walks the
   // candidate selectors; for the closed-root case the bare CSS/host position is
   // used. Falls back to the <sky-login-component> host box offset by field order.
-  private async locateAuthFieldBox(page: any, selectorList?: string): Promise<{ x: number; y: number } | null> {
-    for (const root of this.locatorRoots(page)) {
-      for (const selector of this.selectorCandidates(selectorList)) {
-        try {
-          const loc = root.locator(selector).first();
-          if (await loc.isVisible({ timeout: 800 }).catch(() => false)) {
-            const b = await loc.boundingBox().catch(() => null);
-            if (b) return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
-          }
-        } catch { /* next candidate */ }
-      }
-    }
-    // Fallback: locate the host component and use its rendered box. The email
-    // field sits near the top of the component, password lower down — but since
-    // we type one field per call and re-focus each time, the host's input area
-    // is the reliable click target. We click the visible <input>-shaped child by
-    // probing the host's box top region.
-    try {
-      const hostBox = await page.evaluate(() => {
-        const host = document.querySelector("sky-login-component#sky-login") as HTMLElement | null;
-        if (!host) return null;
-        const r = host.getBoundingClientRect();
-        return { x: r.x, y: r.y, width: r.width, height: r.height };
-      }).catch(() => null);
-      if (hostBox && hostBox.width > 0) {
-        // Click near the labelled input inside the host. The visible field the
-        // user reported focusing sits in the upper portion of the component.
-        return { x: hostBox.x + hostBox.width / 2, y: hostBox.y + 90 };
-      }
-    } catch { /* give up */ }
-    return null;
+private async locateAuthFieldBox(
+    page: any,
+    selectorList?: string,
+    fieldHint: "username" | "password" = "username"
+  ): Promise<{ x: number; y: number } | null> {
+    // Wait until the closed-root host actually has a rendered, non-zero box.
+    // The previous failure was this returning null because the host was not
+    // measurable yet on the Azure container — not a wrong offset.
+    const hostBox = await page.waitForFunction(() => {
+      const host = document.querySelector("sky-login-component#sky-login");
+      if (!host) return null;
+      const r = host.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return null;
+      return { x: r.x, y: r.y, width: r.width, height: r.height };
+    }, { timeout: 15000 })
+      .then((handle: any) => handle.jsonValue())
+      .catch(() => null);
+
+    if (!hostBox) return null;
+
+    // The email and password inputs are visually stacked inside the host.
+    // Measured separation (your console capture): password sat ~86px below
+    // email within a ~224px-tall host => ~0.38 of host height between them,
+    // with email centred in the upper portion (~0.20 of host height down).
+    const x = hostBox.x + hostBox.width / 2;
+    const emailY = hostBox.y + hostBox.height * 0.20;
+    const passwordY = hostBox.y + hostBox.height * 0.58; // 0.20 + 0.38
+
+    return { x, y: fieldHint === "password" ? passwordY : emailY };
   }
 
   private async ensureAuthenticatedPage(page: any, auth: any, expectedUrl: string): Promise<void> {
@@ -550,12 +550,17 @@ export class AccessibilityScanner {
       const field = findDeep(document, "#sky-login-email")
         || findDeep(document, "input[id='sky-login-email']");
       return isLaidOut(field);
-   }, { timeout: 25000 }).then(() => true).catch(() => false);
+    }, { timeout: 25000 }).then(() => true).catch(() => false);
 
+<<<<<<< HEAD
     // Settle so the web component finishes wiring its value listeners before we type.
     await page.waitForTimeout(fieldReady ? 800 : 1500).catch(() => undefined);
   }
-
+  // ── DIAGNOSTIC waitForOtpPage ─────────────────────────────────────────────
+  // Logs URL changes and page state every 5 polls; on timeout, captures a
+  // screenshot and lists visible controls + any Italian/English error message,
+  // so Azure failures are debuggable from log stream alone instead of guessing.
+=======
   private explicitLoginUrlForTarget(auth: any, targetUrl?: string): string {
     const configuredLoginUrl = String(auth?.login_url || "").trim();
     if (!configuredLoginUrl) return "";
@@ -587,6 +592,7 @@ export class AccessibilityScanner {
     }
   }
 
+>>>>>>> e639d05577348a84803ab54fbfd48085e4af6a3c
   private async waitForOtpPage(page: any, auth: any, timeout = 30000): Promise<void> {
     const otpSelector = this.authSelector(auth, "otp_selector");
     const otpSourceSelector = this.authSelector(auth, "otp_source_selector");
