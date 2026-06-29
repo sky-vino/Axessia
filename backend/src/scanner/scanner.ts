@@ -899,28 +899,39 @@ export class AccessibilityScanner {
   private async waitForSkyLoginReady(page: any): Promise<void> {
     await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => undefined);
     await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => undefined);
-    await page.waitForFunction(() => {
-      const find = (selector: string): Element | null => {
-        const direct = document.querySelector(selector);
+
+    // Wait for the ACTUAL credential field inside the nested shadow roots to
+    // exist and be laid out — not just the <sky-login-component> wrapper.
+    // Filling before the inner login-input has hydrated is what produced
+    // "username field was not found / did not retain the value" on cold starts.
+    const fieldReady = await page.waitForFunction(() => {
+      const isLaidOut = (el: Element | null): boolean => {
+        if (!el) return false;
+        const rect = (el as HTMLElement).getBoundingClientRect();
+        const style = window.getComputedStyle(el as HTMLElement);
+        return rect.width > 0 && rect.height > 0 &&
+          style.visibility !== "hidden" && style.display !== "none";
+      };
+      // Recursively pierce open shadow roots looking for the email field.
+      const findDeep = (root: Document | ShadowRoot, selector: string): Element | null => {
+        const direct = root.querySelector(selector);
         if (direct) return direct;
-        for (const el of Array.from(document.querySelectorAll("*"))) {
+        for (const el of Array.from(root.querySelectorAll("*"))) {
           const shadow = (el as HTMLElement).shadowRoot;
           if (!shadow) continue;
-          const found = shadow.querySelector(selector);
+          const found = findDeep(shadow, selector);
           if (found) return found;
-          for (const nested of Array.from(shadow.querySelectorAll("*"))) {
-            const nestedShadow = (nested as HTMLElement).shadowRoot;
-            const nestedFound = nestedShadow?.querySelector(selector);
-            if (nestedFound) return nestedFound;
-          }
         }
         return null;
       };
-      return Boolean(find("#sky-login-email") || document.querySelector("sky-login-component#sky-login"));
-    }, { timeout: 20000 }).catch(() => undefined);
-    await page.waitForTimeout(1500);
-  }
+      const field = findDeep(document, "#sky-login-email")
+        || findDeep(document, "input[id='sky-login-email']");
+      return isLaidOut(field);
+    }, { timeout: 25000 }).then(() => true).catch(() => false);
 
+    // Settle so the web component finishes wiring its value listeners before we type.
+    await page.waitForTimeout(fieldReady ? 800 : 1500).catch(() => undefined);
+  }
   // ── DIAGNOSTIC waitForOtpPage ─────────────────────────────────────────────
   // Logs URL changes and page state every 5 polls; on timeout, captures a
   // screenshot and lists visible controls + any Italian/English error message,

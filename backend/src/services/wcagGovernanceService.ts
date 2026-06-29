@@ -286,6 +286,7 @@ function suspiciousReason(ruleId: string, title: string, wcag: string, criterion
 async function upsertReview(ruleId: string, currentWcag: string[], suggestedWcag: string[], reason: string): Promise<void> {
   const currentJson = JSON.stringify(normalizeCriteria(currentWcag));
   const suggestedJson = JSON.stringify(normalizeCriteria(suggestedWcag));
+
   const existing = await db.query<{ id: string }>(
     `SELECT id
      FROM wcag_mapping_reviews
@@ -298,24 +299,33 @@ async function upsertReview(ruleId: string, currentWcag: string[], suggestedWcag
   if (existing.rows[0]?.id) {
     await db.query(
       `UPDATE wcag_mapping_reviews
-       SET suggested_wcag = $2,
-           reason = $3,
-           last_seen_at = datetime('now')
+       SET suggested_wcag = $2, reason = $3, last_seen_at = datetime('now')
        WHERE id = $1`,
       [existing.rows[0].id, suggestedJson, reason]
     );
     return;
   }
 
-  await db.query(
-    `INSERT INTO wcag_mapping_reviews (rule_id, current_wcag, suggested_wcag, reason, status, first_seen_at, last_seen_at)
-     VALUES ($1, $2, $3, $4, 'pending', datetime('now'), datetime('now'))
-     ON CONFLICT(rule_id, current_wcag, reason) DO UPDATE SET
-       suggested_wcag = excluded.suggested_wcag,
-       last_seen_at = datetime('now'),
-       status = CASE WHEN wcag_mapping_reviews.status = 'resolved' THEN 'pending' ELSE wcag_mapping_reviews.status END`,
-    [ruleId, currentJson, suggestedJson, reason]
-  );
+  try {
+    await db.query(
+      `INSERT INTO wcag_mapping_reviews (rule_id, current_wcag, suggested_wcag, reason, status, first_seen_at, last_seen_at)
+       VALUES ($1, $2, $3, $4, 'pending', datetime('now'), datetime('now'))
+       ON CONFLICT(rule_id, current_wcag, reason) DO UPDATE SET
+         suggested_wcag = excluded.suggested_wcag,
+         last_seen_at = datetime('now'),
+         status = CASE WHEN wcag_mapping_reviews.status = 'resolved' THEN 'pending' ELSE wcag_mapping_reviews.status END`,
+      [ruleId, currentJson, suggestedJson, reason]
+    );
+  } catch (error: any) {
+    // Idempotent fallback: a row with this exact unique tuple already exists.
+    if (error?.code !== "SQLITE_CONSTRAINT") throw error;
+    await db.query(
+      `UPDATE wcag_mapping_reviews
+       SET suggested_wcag = $3, last_seen_at = datetime('now')
+       WHERE rule_id = $1 AND current_wcag = $2 AND reason = $4`,
+      [ruleId, currentJson, suggestedJson, reason]
+    );
+  }
 }
 
 async function criterionTitle(wcag: string): Promise<string | undefined> {
