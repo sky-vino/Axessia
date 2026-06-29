@@ -1,4 +1,4 @@
-﻿/**
+/**
  * scanner.ts
  * ============================================================
  * Main orchestrator for Accessibility scanner.
@@ -296,13 +296,14 @@ export class AccessibilityScanner {
 
       const otpSelector = this.authSelector(auth, "otp_selector");
       const otpSubmitSelector = this.authSelector(auth, "otp_submit_selector");
-      await this.waitForOtpPage(page, auth, 30000);
-      const otpValue = await this.resolveOtpValue(page, auth, 30000);
-      const otpControlVisible = await this.hasVisibleAuthControl(page, otpSelector);
+      const otpWaitMs = Math.max(30000, Math.min(Number(auth.post_login_wait_ms || 0) || 60000, 120000));
+      const postSubmitState = await this.waitForOtpOrAuthenticatedState(page, auth, loginUrl, targetUrl || loginStartUrl, otpWaitMs);
+      const otpValue = postSubmitState === "otp" ? await this.resolveOtpValue(page, auth, 30000) : "";
+      const otpControlVisible = postSubmitState === "otp" && await this.hasVisibleAuthControl(page, otpSelector);
       if (otpSelector && otpControlVisible && !otpValue) {
         throw new Error("OTP input is visible, but no OTP value could be resolved from the configured page selector or manual OTP code.");
       }
-      if (otpSelector && otpValue) {
+      if (postSubmitState === "otp" && otpSelector && otpValue) {
         try {
           await this.fillOtpInputs(page, otpSelector, otpValue, Math.min(auth.post_login_wait_ms || 8000, 15000));
           const otpVerified = await this.verifyOtpInputs(page, otpSelector, otpValue);
@@ -524,21 +525,89 @@ export class AccessibilityScanner {
   }
 
   private async waitForOtpPage(page: any, auth: any, timeout = 30000): Promise<void> {
+    const state = await this.waitForOtpOrAuthenticatedState(page, auth, page.url(), page.url(), timeout);
+    if (state === "otp") return;
+  }
+
+  private async waitForOtpOrAuthenticatedState(page: any, auth: any, loginUrl: string, targetUrl: string, timeout = 60000): Promise<"otp" | "authenticated"> {
     const otpSelector = this.authSelector(auth, "otp_selector");
     const otpSourceSelector = this.authSelector(auth, "otp_source_selector");
+    const passwordSelector = this.authSelector(auth, "password_selector");
+    const usernameSelector = this.authSelector(auth, "username_selector");
     const deadline = Date.now() + timeout;
+    let lastUrl = "";
+    let lastState = "";
+
     while (Date.now() < deadline) {
+      const currentUrl = (() => {
+        try { return page.url(); } catch { return ""; }
+      })();
       const hasOtpText = Boolean(await this.resolveOtpValue(page, auth, 1000).catch(() => ""));
       const hasOtpInput = await this.hasVisibleAuthControl(page, otpSelector).catch(() => false);
       const hasSource = await this.hasVisibleAuthControl(page, otpSourceSelector).catch(() => false);
       if (hasOtpText || hasOtpInput || hasSource) {
         this.onProgress(17, "SUCCESS: OTP page detected");
-        return;
+        return "otp";
       }
-      await page.waitForLoadState("domcontentloaded", { timeout: 1000 }).catch(() => undefined);
-      await page.waitForTimeout(700);
+
+      if (await this.pageLooksAuthenticatedWithoutLoginForm(page, targetUrl || currentUrl).catch(() => false)) {
+        this.onProgress(20, "SUCCESS: Login completed without OTP prompt");
+        return "authenticated";
+      }
+
+      const loginState = await this.readVisibleLoginState(page).catch(() => ({ text: "", errorText: "" }));
+      const passwordVisible = await this.hasVisibleAuthControl(page, passwordSelector).catch(() => false);
+      const usernameVisible = await this.hasVisibleAuthControl(page, usernameSelector).catch(() => false);
+      lastUrl = currentUrl;
+      lastState = loginState.errorText || loginState.text;
+
+      if (loginState.errorText) {
+        throw new Error(`Login did not advance to OTP because the page shows an error: ${loginState.errorText}`);
+      }
+      if ((passwordVisible || usernameVisible) && currentUrl === loginUrl && Date.now() + 8000 < deadline) {
+        await page.waitForTimeout(1200).catch(() => undefined);
+        continue;
+      }
+
+      await page.waitForLoadState("domcontentloaded", { timeout: 1500 }).catch(() => undefined);
+      await page.waitForLoadState("networkidle", { timeout: 2500 }).catch(() => undefined);
+      await page.waitForTimeout(900).catch(() => undefined);
     }
-    throw new Error("OTP page did not appear after clicking Accedi.");
+
+    const details = [
+      lastUrl ? `current URL: ${lastUrl}` : "current URL unavailable",
+      lastState ? `visible state: ${lastState}` : "no visible login error captured"
+    ].join("; ");
+    throw new Error(`OTP page did not appear after clicking Accedi within ${timeout}ms (${details}).`);
+  }
+
+  private async readVisibleLoginState(page: any): Promise<{ text: string; errorText: string }> {
+    return await page.evaluate(() => {
+      const visible = (el: Element) => {
+        const rect = (el as HTMLElement).getBoundingClientRect();
+        const style = window.getComputedStyle(el as HTMLElement);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const bodyText = (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 500);
+      const errorSelectors = [
+        "[role='alert']",
+        "[aria-live]",
+        ".error",
+        ".errors",
+        ".invalid",
+        ".sky-login-error",
+        ".sky-login-alert",
+        ".notification-error"
+      ];
+      const errorText = errorSelectors
+        .flatMap(selector => Array.from(document.querySelectorAll(selector)))
+        .filter(visible)
+        .map(el => ((el as HTMLElement).innerText || el.textContent || "").replace(/\s+/g, " ").trim())
+        .filter(Boolean)
+        .join(" | ")
+        .slice(0, 500);
+      return { text: bodyText, errorText };
+    });
   }
 
   private selectorCandidates(selectorList?: string): string[] {
