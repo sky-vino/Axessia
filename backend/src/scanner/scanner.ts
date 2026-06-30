@@ -296,7 +296,7 @@ export class AccessibilityScanner {
 
       const otpSelector = this.authSelector(auth, "otp_selector");
       const otpSubmitSelector = this.authSelector(auth, "otp_submit_selector");
-      await this.waitForOtpPage(page, auth, 30000);
+      await this.waitForOtpPage(page, auth, 120000);
       const otpValue = await this.resolveOtpValue(page, auth, 30000);
       const otpControlVisible = await this.hasVisibleAuthControl(page, otpSelector);
       if (otpSelector && otpControlVisible && !otpValue) {
