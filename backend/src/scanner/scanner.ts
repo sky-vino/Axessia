@@ -1,18 +1,18 @@
-﻿/**
+/**
  * scanner.ts
  * ============================================================
  * Main orchestrator for Accessibility scanner.
  * Wires all modules:
  *
- *  navigation.ts      — safe retry-based page navigation
- *  axeScan.ts         — axe-core WCAG 2.0/2.1/2.2 engine
- *  heuristics.ts      — heading structure, landmarks, forms, reflow, motion, lang
- *  focusHeuristics.ts — focus visible/obscured/trap/lock/escape
- *  keyboardNav.ts     — real Tab/Arrow/Escape keyboard simulation
- *  colorContrast.ts   — actual contrast ratio measurement
- *  zoomPointer.ts     — zoom lock, reflow, touch targets, gestures
- *  stateScanner.ts    — hover/focus/expanded/error/tab states + dynamic interactions
- *  ownership.ts       — component/owner attribution
+ *  navigation.ts      â€” safe retry-based page navigation
+ *  axeScan.ts         â€” axe-core WCAG 2.0/2.1/2.2 engine
+ *  heuristics.ts      â€” heading structure, landmarks, forms, reflow, motion, lang
+ *  focusHeuristics.ts â€” focus visible/obscured/trap/lock/escape
+ *  keyboardNav.ts     â€” real Tab/Arrow/Escape keyboard simulation
+ *  colorContrast.ts   â€” actual contrast ratio measurement
+ *  zoomPointer.ts     â€” zoom lock, reflow, touch targets, gestures
+ *  stateScanner.ts    â€” hover/focus/expanded/error/tab states + dynamic interactions
+ *  ownership.ts       â€” component/owner attribution
  */
 
 import { chromium } from "playwright";
@@ -47,6 +47,7 @@ export class AccessibilityScanner {
   private navigatedUrls: string[] = [];
   private navigatedUrlKeys = new Set<string>();
   private scannedPageKeys = new Set<string>();
+  private lastAuthFailureEvidence?: { phase: string; url: string; screenshot?: string; summary?: string };
 
   constructor(scan: any, onProgress: ProgressCallback) {
     this.scan = scan;
@@ -267,31 +268,48 @@ export class AccessibilityScanner {
       }
       const loginUrl = page.url();
 
-      logger.info(`Using configured login selectors: username='${usernameSelector}', password='${passwordSelector}', submit='${submitSelector}'`);
+      logger.info(`[AUTH-DIAG] Using configured login selectors: username='${usernameSelector}', password='${passwordSelector}', submit='${submitSelector}'`);
+      await this.captureAuthDiagnosticSnapshot(page, "auth-login-ready", auth, "Login form readiness completed before entering credentials.");
 
+      logger.info(`[AUTH-DIAG] Username fill started; currentUrl=${page.url()}`);
       const usernameFilled = await this.tryFillFirst(page, usernameSelector, auth.username || "", 30000);
       const usernameVerified = usernameFilled && await this.verifyFieldValue(page, usernameSelector, auth.username || "");
+      logger.info(`[AUTH-DIAG] Username fill result: filled=${usernameFilled}; verified=${usernameVerified}; currentUrl=${page.url()}`);
       if (!usernameVerified) {
+        await this.captureAuthDiagnosticSnapshot(page, "auth-username-fill-failure", auth, "Username field was not found, was not filled, or did not retain the value.");
         throw new Error(`Login username field was not found, was not filled, or did not retain the value with selector: ${usernameSelector}`);
       }
       this.onProgress(12, "SUCCESS: Username entered");
 
+      logger.info(`[AUTH-DIAG] Password fill started; currentUrl=${page.url()}`);
       let passwordFilled = await this.tryFillFirst(page, passwordSelector, auth.password || "", 30000);
       let passwordVerified = passwordFilled && await this.verifyFieldValue(page, passwordSelector, auth.password || "");
+      logger.info(`[AUTH-DIAG] Password fill result: filled=${passwordFilled}; verified=${passwordVerified}; currentUrl=${page.url()}`);
 
       if (!passwordVerified) {
+        await this.captureAuthDiagnosticSnapshot(page, "auth-password-fill-failure", auth, "Password field was not found, was not filled, or did not retain the value.");
         throw new Error(`Login password field was not found, was not filled, or did not retain the value with selector: ${passwordSelector}`);
       }
       this.onProgress(16, "SUCCESS: Password entered");
 
       if (auth.auto_accept_cookies !== false) await this.waitAndClearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"), 8000);
       const readyToSubmit = await this.verifyFieldValue(page, usernameSelector, auth.username || "") && await this.verifyFieldValue(page, passwordSelector, auth.password || "");
+      logger.info(`[AUTH-DIAG] Pre-Accedi credential verification: readyToSubmit=${readyToSubmit}; currentUrl=${page.url()}`);
       if (!readyToSubmit) {
+        await this.captureAuthDiagnosticSnapshot(page, "auth-pre-accedi-verification-failure", auth, "Username/password were not both verified immediately before Accedi.");
         throw new Error("Refusing to click Accedi because username/password are not both verified immediately before submit.");
       }
+      await this.captureAuthDiagnosticSnapshot(page, "auth-before-accedi-click", auth, "Immediately before clicking Accedi.");
+      logger.info(`[AUTH-DIAG] Clicking Accedi with configured submit selector.`);
       const submittedPassword = await this.tryClickFirst(page, submitSelector);
-      if (!submittedPassword) await page.keyboard.press("Enter").catch(() => undefined);
+      if (!submittedPassword) {
+        logger.info(`[AUTH-DIAG] Configured submit selector was not clicked; pressing Enter as fallback.`);
+        await page.keyboard.press("Enter").catch(() => undefined);
+      }
+      await page.waitForTimeout(800).catch(() => undefined);
+      await this.captureAuthDiagnosticSnapshot(page, "auth-after-accedi-click", auth, "Immediately after Accedi click/Enter fallback.");
       await this.waitForLoginTransition(page, auth, loginUrl, 20000);
+      await this.captureAuthDiagnosticSnapshot(page, "auth-after-login-transition", auth, "After login transition wait following Accedi.");
       if (auth.auto_accept_cookies !== false) await this.clearCookieConsent(page, this.authSelector(auth, "cookie_accept_selector"));
 
       const otpSelector = this.authSelector(auth, "otp_selector");
@@ -438,7 +456,7 @@ export class AccessibilityScanner {
   private addScanRunFailureIssue(url: string, err: unknown): void {
     const message = (err as Error)?.message || String(err || "scan failed");
     const isAuthFailure = /login|authentication|password|otp|username|auth/i.test(message);
-    this.allIssues.push({
+    const failureIssue: ScanIssue = {
       ruleId: isAuthFailure ? "authenticated-scan-not-completed" : "scan-run-not-completed",
       severity: "serious",
       category: isAuthFailure ? "authentication-coverage" : "scan-coverage",
@@ -452,7 +470,12 @@ export class AccessibilityScanner {
         ? "Verify the supplied credentials, OTP source/manual OTP value, login selectors, MFA timing, and whether the security page is waiting for user action."
         : "Check whether the page is reachable, whether the scanner can load it, and whether any configured journey selector blocked execution.",
       evidenceExplanation: `Scan stopped before the requested page could be tested. Error: ${message}`
-    });
+    };
+    if (isAuthFailure && this.lastAuthFailureEvidence?.screenshot) {
+      failureIssue.evidenceScreenshot = this.lastAuthFailureEvidence.screenshot;
+      failureIssue.evidenceExplanation = `Authentication failed at ${this.lastAuthFailureEvidence.phase}. ${this.lastAuthFailureEvidence.summary || "See the attached screenshot for the browser state."} Error: ${message}`;
+    }
+    this.allIssues.push(failureIssue);
     this.testCases.push({
       name: isAuthFailure ? "Authenticated scan login gate" : "Scan execution gate",
       description: isAuthFailure
@@ -526,21 +549,37 @@ export class AccessibilityScanner {
   private async waitForOtpPage(page: any, auth: any, timeout = 30000): Promise<void> {
     const otpSelector = this.authSelector(auth, "otp_selector");
     const otpSourceSelector = this.authSelector(auth, "otp_source_selector");
-    const deadline = Date.now() + timeout;
+    const startedAt = Date.now();
+    const deadline = startedAt + timeout;
+    const snapshotMarks = new Set<string>();
+    logger.info(`[AUTH-DIAG] OTP wait started: timeoutMs=${timeout}; currentUrl=${page.url()}`);
+    await this.captureAuthDiagnosticSnapshot(page, "auth-otp-wait-start", auth, "Start of OTP wait window after Accedi.");
     while (Date.now() < deadline) {
+      const elapsed = Date.now() - startedAt;
+      const remaining = Math.max(0, deadline - Date.now());
       const hasOtpText = Boolean(await this.resolveOtpValue(page, auth, 1000).catch(() => ""));
       const hasOtpInput = await this.hasVisibleAuthControl(page, otpSelector).catch(() => false);
       const hasSource = await this.hasVisibleAuthControl(page, otpSourceSelector).catch(() => false);
+      logger.info(`[AUTH-DIAG] OTP wait check: elapsedMs=${elapsed}; remainingMs=${remaining}; hasOtpText=${hasOtpText}; hasOtpInput=${hasOtpInput}; hasOtpSource=${hasSource}; currentUrl=${page.url()}`);
       if (hasOtpText || hasOtpInput || hasSource) {
+        await this.captureAuthDiagnosticSnapshot(page, "auth-otp-detected", auth, "OTP page/input/source detected.");
         this.onProgress(17, "SUCCESS: OTP page detected");
         return;
+      }
+      if (elapsed >= Math.floor(timeout * 0.33) && !snapshotMarks.has("during")) {
+        snapshotMarks.add("during");
+        await this.captureAuthDiagnosticSnapshot(page, "auth-otp-wait-during", auth, "During OTP wait window; OTP not detected yet.");
+      }
+      if (remaining <= 8000 && !snapshotMarks.has("near-end")) {
+        snapshotMarks.add("near-end");
+        await this.captureAuthDiagnosticSnapshot(page, "auth-otp-wait-near-end", auth, "Near the end of OTP wait window; OTP still not detected.");
       }
       await page.waitForLoadState("domcontentloaded", { timeout: 1000 }).catch(() => undefined);
       await page.waitForTimeout(700);
     }
+    await this.captureAuthDiagnosticSnapshot(page, "auth-otp-wait-failure", auth, "OTP wait timed out; this is the point of authentication failure.");
     throw new Error("OTP page did not appear after clicking Accedi.");
   }
-
   private selectorCandidates(selectorList?: string): string[] {
     return String(selectorList || "")
       .split(/\n|\|/)
@@ -629,7 +668,7 @@ export class AccessibilityScanner {
     const escaped = this.escapeRegExp(label);
     const pattern = new RegExp(`^\\s*${escaped}\\s*$`, "i");
     const relaxedPattern = new RegExp(
-      this.escapeRegExp(label).replace(/\\s+/g, "\\s+").replace(/[’']/g, "[’']"),
+      this.escapeRegExp(label).replace(/\\s+/g, "\\s+").replace(/[â€™']/g, "[â€™']"),
       "i"
     );
     for (const root of this.locatorRoots(page)) {
@@ -2601,7 +2640,7 @@ export class AccessibilityScanner {
         });
       const sidebar = containers[0];
       if (!sidebar) return [];
-      const excluded = /^(x|×|close|chiudi|indietro|back|conferma|submit)$/i;
+      const excluded = /^(x|Ã—|close|chiudi|indietro|back|conferma|submit)$/i;
       return Array.from(sidebar.querySelectorAll("a[href],button,[role='button'],[role='link'],[tabindex]"))
         .filter(el => visible(el))
         .map(el => {
@@ -3048,6 +3087,46 @@ export class AccessibilityScanner {
     return targets;
   }
 
+  private async captureAuthDiagnosticSnapshot(page: any, phase: string, auth: any, reason: string): Promise<void> {
+    try {
+      const url = (() => { try { return page.url(); } catch { return "unknown"; } })();
+      const signals = await this.readAuthDiagnosticSignals(page, auth).catch(() => ({ summary: "Unable to read page diagnostic signals." }));
+      const snapshot = await this.captureSnapshot(page, url, phase, true);
+      this.domSnapshots.push(snapshot);
+      this.lastAuthFailureEvidence = {
+        phase,
+        url,
+        screenshot: snapshot.screenshot,
+        summary: `${reason} ${signals.summary || ""}`.trim(),
+      };
+      logger.info(`[AUTH-DIAG] Captured ${phase}: reason=${reason}; url=${url}; ${signals.summary || ""}`);
+    } catch (err) {
+      logger.warn(`[AUTH-DIAG] Failed to capture ${phase}:`, err);
+    }
+  }
+
+  private async readAuthDiagnosticSignals(page: any, auth: any): Promise<{ summary: string }> {
+    const otpSelector = this.authSelector(auth, "otp_selector");
+    const otpSourceSelector = this.authSelector(auth, "otp_source_selector");
+    const usernameSelector = this.authSelector(auth, "username_selector");
+    const passwordSelector = this.authSelector(auth, "password_selector");
+    const submitSelector = this.authSelector(auth, "submit_selector");
+    const [hasUsername, hasPassword, hasSubmit, hasOtpInput, hasOtpSource, pageInfo] = await Promise.all([
+      this.hasVisibleAuthControl(page, usernameSelector).catch(() => false),
+      this.hasVisibleAuthControl(page, passwordSelector).catch(() => false),
+      this.hasVisibleAuthControl(page, submitSelector).catch(() => false),
+      this.hasVisibleAuthControl(page, otpSelector).catch(() => false),
+      this.hasVisibleAuthControl(page, otpSourceSelector).catch(() => false),
+      page.evaluate(() => {
+        const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 500);
+        return { title: document.title || "", text };
+      }).catch(() => ({ title: "", text: "" })),
+    ]);
+    return {
+      summary: `title=${JSON.stringify(pageInfo.title)}; hasUsername=${hasUsername}; hasPassword=${hasPassword}; hasSubmit=${hasSubmit}; hasOtpInput=${hasOtpInput}; hasOtpSource=${hasOtpSource}; visibleText=${JSON.stringify(pageInfo.text)}`,
+    };
+  }
+
   private async captureSnapshot(page: any, url: string, phase: string, screenshot = true): Promise<DomSnapshot> {
     let a11yTree: any = null;
     let screenshotData: string | undefined;
@@ -3305,7 +3384,7 @@ export class AccessibilityScanner {
         issueRuleId: issue.ruleId,
         issueUrl: issue.url,
         steps: [],
-        result: `FAIL — ${issue.message}`,
+        result: `FAIL â€” ${issue.message}`,
       });
     }
   }
